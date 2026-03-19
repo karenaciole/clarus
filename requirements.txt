@@ -1,0 +1,18 @@
+# Orquestração e RAG
+llama-index==0.12.*
+llama-index-llms-ollama
+llama-index-embeddings-huggingface
+llama-index-readers-file
+
+# Interface e Visualização
+streamlit
+watchdog
+tenacity>=8.1,<9
+
+# Processamento de Documentos e Relatórios
+fpdf2
+pypdf
+sentence-transformers
+
+# Utilidades
+python-dotenv
