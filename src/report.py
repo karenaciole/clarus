@@ -62,7 +62,6 @@ def generate_technical_report(chat_history, documents, insights, filename="relat
 
     pdf_data = pdf.output()
 
-    # Streamlit download_button expects bytes for binary payloads.
     if isinstance(pdf_data, bytearray):
         return bytes(pdf_data)
     if isinstance(pdf_data, str):
