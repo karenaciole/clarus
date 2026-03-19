@@ -45,7 +45,7 @@ def generate_technical_report(chat_history, documents, insights, filename="relat
 
         if role == 'user':
             pdf.set_font("helvetica", "B", 10)
-            _write_multiline(pdf, f"Pergunta {i+1}: {content}", line_height=7)
+            _write_multiline(pdf, f"Pergunta {i}: {content}", line_height=7)
 
         if role == 'assistant':
             pdf.set_font("helvetica", "", 10)
