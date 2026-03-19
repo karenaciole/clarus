@@ -65,6 +65,9 @@ with st.sidebar:
                     doc_names,
                     insights_finais
                 )
+
+                if isinstance(pdf_bytes, bytearray):
+                    pdf_bytes = bytes(pdf_bytes)
                 
                 st.download_button(
                     label="📥 Baixar Relatório PDF",

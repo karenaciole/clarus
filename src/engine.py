@@ -39,5 +39,6 @@ class RAG:
             raise ValueError("O índice de documentos não foi criado. Por favor, crie o índice antes de fazer uma consulta.")
         
         response = self.chat_engine.query(query)
-        return response
+
+        return getattr(response, "response", str(response))
 
