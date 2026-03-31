@@ -12,6 +12,7 @@ from llama_index.embeddings.huggingface import HuggingFaceEmbedding
 from llama_index.core.node_parser import SentenceSplitter
 from llama_index.core.llms import ChatMessage
 from config.settings import Settings as ConfigSettings
+from config.logging_config import app_logger
 
 _EMBEDDING_CACHE = {}
 
@@ -35,6 +36,15 @@ class RAG:
         self.index = None
         self.chat_engine = None
         self.query_engine = None
+        self.logger = app_logger
+        self.logger.info("RAG engine initialized.")
+        self.logger.info(f"LLM Provider: {ConfigSettings.llm_provider}")
+        if ConfigSettings.llm_provider == "ollama":
+            self.logger.info(f"Ollama Model: {ConfigSettings.ollama_model_name}")
+        else:
+            self.logger.info(f"Gemini Model: {ConfigSettings.gemini_model_name}")
+        self.logger.info(f"Embedding Model: {ConfigSettings.embedding_model_name}")
+        self.logger.info(f"Persistence enabled: {ConfigSettings.persist_index}")
 
     def _build_llm(self):
         provider = ConfigSettings.llm_provider.lower()
@@ -57,27 +67,43 @@ class RAG:
 
     def _build_system_prompt(self):
         return (
-            "Você é um assistente técnico altamente qualificado, especializado em análise de documentos. "
-            "Sua principal função é extrair, analisar e estruturar informações críticas. "
-            "Ao analisar o contexto fornecido, siga estritamente estas diretrizes:\n"
-            "1.  **Identificação de Requisitos**: Liste todos os requisitos funcionais e não funcionais mencionados.\n"
-            "2.  **Análise de Riscos**: Identifique e descreva os potenciais riscos técnicos, operacionais e de negócio.\n"
-            "3.  **Sugestão de Recomendações**: Proponha recomendações claras e acionáveis para mitigar os riscos e atender aos requisitos.\n"
-            "4.  **Formato da Resposta**: Apresente a resposta de forma organizada, utilizando seções distintas para 'Requisitos', 'Riscos' e 'Recomendações'.\n"
-            "5.  **Idioma**: Responda sempre em Português (Brasil), com um tom profissional e direto.\n"
-            "6.  **Fidelidade ao Contexto**: Baseie-se exclusivamente nas informações contidas nos documentos fornecidos."
+            "Você é o Clarus, um assistente de análise técnica de documentos. Sua comunicação deve ser sempre em Português (Brasil).\n\n"
+            "**Sua Missão Principal:**\n"
+            "Responder às perguntas do usuário de forma precisa e objetiva, baseando-se **exclusivamente** no conteúdo dos documentos fornecidos como contexto. Não utilize conhecimento prévio ou informações externas.\n\n"
+            "**Diretrizes de Resposta:**\n"
+            "1. **Fidelidade ao Contexto**: Se a resposta para uma pergunta não estiver nos documentos, afirme claramente: 'Com base nos documentos fornecidos, não encontrei informações sobre este tópico.'\n"
+            "2. **Clareza e Organização**: Apresente as respostas de forma clara. Use listas (bullet points) para detalhar informações e **negrito** para destacar termos e conceitos importantes.\n"
+            "3. **Tom Profissional**: Mantenha um tom profissional e direto, focando em fornecer informações úteis e precisas."
+        )
+
+    def _build_report_prompt_template(self):
+        return (
+            "Você é um assistente técnico sênior, especializado em compilar relatórios de análise detalhados. "
+            "Sua tarefa é sintetizar a conversa e os documentos fornecidos em um relatório final estruturado.\n\n"
+            "Com base em toda a conversa e nos documentos analisados, elabore um texto estruturado contendo:\n"
+            "1.  **Principais Insights**: Um resumo dos pontos mais importantes discutidos.\n"
+            "2.  **Identificação de Requisitos**: Liste todos os requisitos funcionais e não funcionais mencionados.\n"
+            "3.  **Análise de Riscos**: Identifique e descreva os potenciais riscos técnicos, operacionais e de negócio.\n"
+            "4.  **Sugestão de Recomendações**: Proponha recomendações claras e acionáveis para mitigar os riscos e atender aos requisitos.\n\n"
+            "**Formato da Resposta**: Apresente a resposta de forma organizada, utilizando seções distintas para cada um dos pontos acima.\n"
+            "**Idioma**: Responda sempre em Português (Brasil), com um tom profissional e direto.\n"
+            "**Fidelidade ao Contexto**: Baseie-se exclusivamente nas informações contidas no histórico da conversa e nos documentos."
         )
 
     def create_index(self, documents, index_persist_dir):
         if not documents:
             raise ValueError("Cannot create index from an empty list of documents.")
 
+        self.logger.info(f"Creating index from {len(documents)} documents.")
         if ConfigSettings.persist_index and os.path.exists(index_persist_dir):
+            self.logger.info(f"Loading existing index from: {index_persist_dir}")
             storage_context = StorageContext.from_defaults(persist_dir=index_persist_dir)
             self.index = load_index_from_storage(storage_context)
         else:
+            self.logger.info("Building new index.")
             self.index = VectorStoreIndex.from_documents(documents)
             if ConfigSettings.persist_index:
+                self.logger.info(f"Persisting index to: {index_persist_dir}")
                 self.index.storage_context.persist(persist_dir=index_persist_dir)
 
         self.chat_engine = self.index.as_chat_engine(
@@ -96,11 +122,28 @@ class RAG:
         history_messages = [ChatMessage(role=m["role"], content=m["content"]) for m in chat_history]
         limited_history = history_messages[-ConfigSettings.history_turns:] if history_messages else []
         
-        # The CondensePlusContextChatEngine uses the .chat() method, not .query()
         if hasattr(self.chat_engine, "chat"):
             response = self.chat_engine.chat(query, chat_history=limited_history)
         else:
-            response = self.chat_engine.query(query) # Fallback for other engine types
+            response = self.chat_engine.query(query) 
 
-        return getattr(response, "response", str(response))
+        response_text = getattr(response, "response", str(response))
+        self.logger.info(f"Query response: '{response_text[:100]}...'")
+        return response_text
 
+    def generate_report_query(self, chat_history):
+        if not self.query_engine:
+            raise ValueError("Document index has not been created. Please create the index before querying.")
+
+        self.logger.info("Generating final report.")
+        report_prompt = self._build_report_prompt_template()
+        
+        conversation_summary = "\n".join([f"{m['role']}: {m['content']}" for m in chat_history])
+        final_query = f"{report_prompt}\n\nAqui está o histórico da nossa conversa para contexto:\n{conversation_summary}"
+
+        self.logger.info("Executing report generation query.")
+        response = self.query_engine.query(final_query)
+        
+        response_text = getattr(response, "response", str(response))
+        self.logger.info("Report generation complete.")
+        return response_text

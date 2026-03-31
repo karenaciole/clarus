@@ -3,7 +3,6 @@ from datetime import datetime
 import sys
 from pathlib import Path
 
-# --- Project Root Setup ---
 project_root = Path(__file__).resolve().parents[1]
 if str(project_root) not in sys.path:
     sys.path.insert(0, str(project_root))
@@ -23,7 +22,6 @@ def generate_technical_report(chat_history, documents, insights, filename="relat
     def _to_text(value):
         if value is None:
             return ""
-        # Ensure content is properly decoded to handle special characters
         text = getattr(value, "response", str(value))
         try:
             return text.encode('latin-1', 'replace').decode('latin-1')
@@ -33,7 +31,12 @@ def generate_technical_report(chat_history, documents, insights, filename="relat
     def _write_multiline(pdf_obj, text, line_height=6):
         content_width = pdf_obj.w - pdf_obj.l_margin - pdf_obj.r_margin
         pdf_obj.set_x(pdf_obj.l_margin)
-        pdf_obj.multi_cell(content_width, line_height, _to_text(text))
+        pdf_obj.multi_cell(
+            content_width, 
+            line_height, 
+            _to_text(text), 
+            markdown=True
+        )
 
     pdf = Report()
     pdf.set_auto_page_break(auto=True, margin=15)
