@@ -5,6 +5,7 @@ from llama_index.core import (
     SimpleDirectoryReader,
     StorageContext,
     load_index_from_storage,
+    PromptTemplate,
 )
 from llama_index.llms.ollama import Ollama
 from llama_index.llms.gemini import Gemini
@@ -13,6 +14,9 @@ from llama_index.core.node_parser import SentenceSplitter
 from llama_index.core.llms import ChatMessage
 from config.settings import Settings as ConfigSettings
 from config.logging_config import app_logger
+
+from llama_index.core.response_synthesizers import get_response_synthesizer
+from llama_index.core.query_engine import RetrieverQueryEngine
 
 _EMBEDDING_CACHE = {}
 
@@ -132,17 +136,28 @@ class RAG:
         return response_text
 
     def generate_report_query(self, chat_history):
-        if not self.query_engine:
+        if not self.index:
             raise ValueError("Document index has not been created. Please create the index before querying.")
 
         self.logger.info("Generating final report.")
-        report_prompt = self._build_report_prompt_template()
         
-        conversation_summary = "\n".join([f"{m['role']}: {m['content']}" for m in chat_history])
-        final_query = f"{report_prompt}\n\nAqui está o histórico da nossa conversa para contexto:\n{conversation_summary}"
+        report_prompt_template = PromptTemplate(self._build_report_prompt_template())
+        
+        conversation_summary = "\n".join([f"- {m['role']}: {m['content']}" for m in chat_history])
 
-        self.logger.info("Executing report generation query.")
-        response = self.query_engine.query(final_query)
+        response_synthesizer = get_response_synthesizer(
+            response_mode="tree_summarize", 
+            summary_template=report_prompt_template,
+            use_async=True
+        )
+        retriever = self.index.as_retriever(similarity_top_k=ConfigSettings.similarity_top_k)
+
+        query_engine_for_report = RetrieverQueryEngine(
+            retriever=retriever,
+            response_synthesizer=response_synthesizer,
+        )
+        self.logger.info("Executing report generation query with conversation summary.")
+        response = query_engine_for_report.query(conversation_summary)
         
         response_text = getattr(response, "response", str(response))
         self.logger.info("Report generation complete.")
