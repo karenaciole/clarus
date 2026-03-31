@@ -1,5 +1,11 @@
 from fpdf import FPDF
 from datetime import datetime
+import sys
+from pathlib import Path
+
+project_root = Path(__file__).resolve().parents[1]
+if str(project_root) not in sys.path:
+    sys.path.insert(0, str(project_root))
 
 class Report(FPDF):
     def header(self):
@@ -16,12 +22,21 @@ def generate_technical_report(chat_history, documents, insights, filename="relat
     def _to_text(value):
         if value is None:
             return ""
-        return getattr(value, "response", str(value))
+        text = getattr(value, "response", str(value))
+        try:
+            return text.encode('latin-1', 'replace').decode('latin-1')
+        except (UnicodeEncodeError, UnicodeDecodeError):
+            return text.encode('utf-8', 'replace').decode('utf-8')
 
     def _write_multiline(pdf_obj, text, line_height=6):
         content_width = pdf_obj.w - pdf_obj.l_margin - pdf_obj.r_margin
         pdf_obj.set_x(pdf_obj.l_margin)
-        pdf_obj.multi_cell(content_width, line_height, _to_text(text))
+        pdf_obj.multi_cell(
+            content_width, 
+            line_height, 
+            _to_text(text), 
+            markdown=True
+        )
 
     pdf = Report()
     pdf.set_auto_page_break(auto=True, margin=15)
@@ -39,15 +54,17 @@ def generate_technical_report(chat_history, documents, insights, filename="relat
     pdf.cell(0, 10, "Perguntas e Respostas Realizadas", ln=True)
     pdf.ln(2)
     
-    for i, chat in enumerate(chat_history):
-        content = _to_text(chat.get('content', ''))
+    question_number = 1
+    for chat in chat_history:
+        content = chat.get('content', '')
         role = chat.get('role')
 
         if role == 'user':
             pdf.set_font("helvetica", "B", 10)
-            _write_multiline(pdf, f"Pergunta {i}: {content}", line_height=7)
+            _write_multiline(pdf, f"Pergunta {question_number}: {content}", line_height=7)
+            question_number += 1
 
-        if role == 'assistant':
+        elif role == 'assistant':
             pdf.set_font("helvetica", "", 10)
             _write_multiline(pdf, f"Resposta: {content}", line_height=6)
             pdf.ln(4)

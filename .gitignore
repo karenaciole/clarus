@@ -1,1 +1,6 @@
 data/
+.env
+*.log
+BRAG_DOCUMENT.md
+__pycache__/
+*.pdf

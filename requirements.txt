@@ -1,11 +1,12 @@
 # Orquestração e RAG
-llama-index==0.12.*
-llama-index-llms-ollama
-llama-index-embeddings-huggingface
+llama-index==0.10.20
+llama-index-llms-ollama==0.1.2
+llama-index-embeddings-huggingface==0.2.0
 llama-index-readers-file
+llama-index-llms-gemini==0.1.5
 
 # Interface e Visualização
-streamlit
+streamlit==1.32.2
 watchdog
 tenacity>=8.1,<9
 
@@ -15,4 +16,5 @@ pypdf
 sentence-transformers
 
 # Utilidades
-python-dotenv
+python-dotenv==1.0.1
+fpdf2==2.7.8
