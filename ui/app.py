@@ -108,11 +108,10 @@ def handle_report_generation():
         st.session_state.logger.info("Generate report button clicked.")
         with st.spinner("Sintetizando conclusões..."):
             try:
-                insights = st.session_state.rag_manager.generate_report_query(st.session_state.chat_history)
+                report_data = st.session_state.rag_manager.generate_report_data(st.session_state.chat_history)
                 pdf_bytes = generate_technical_report(
-                    st.session_state.chat_history,
-                    st.session_state.indexed_doc_names,
-                    insights
+                    report_data,
+                    st.session_state.indexed_doc_names
                 )
                 
                 st.download_button(

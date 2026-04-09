@@ -4,3 +4,4 @@ data/
 BRAG_DOCUMENT.md
 __pycache__/
 *.pdf
+.model_cache/

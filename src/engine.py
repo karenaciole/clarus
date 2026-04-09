@@ -1,4 +1,11 @@
 import os
+import sys
+from pathlib import Path
+
+project_root = Path(__file__).resolve().parents[1]
+if str(project_root) not in sys.path:
+    sys.path.insert(0, str(project_root))
+
 from llama_index.core import (
     VectorStoreIndex,
     Settings,
@@ -8,7 +15,6 @@ from llama_index.core import (
     PromptTemplate,
 )
 from llama_index.llms.ollama import Ollama
-from llama_index.llms.gemini import Gemini
 from llama_index.embeddings.huggingface import HuggingFaceEmbedding
 from llama_index.core.node_parser import SentenceSplitter
 from llama_index.core.llms import ChatMessage
@@ -17,7 +23,8 @@ from config.logging_config import app_logger
 from src.prompts import (
     SYSTEM_PROMPT, 
     REPORT_PROMPT_TEMPLATE, 
-    REPORT_QUERY_GENERATION_PROMPT
+    REPORT_QUERY_GENERATION_PROMPT,
+    CONVERSATION_SUMMARY_PROMPT
 )
 
 from llama_index.core.response_synthesizers import get_response_synthesizer
@@ -26,7 +33,12 @@ _EMBEDDING_CACHE = {}
 
 def _get_embed_model(model_name):
     if model_name not in _EMBEDDING_CACHE:
-        _EMBEDDING_CACHE[model_name] = HuggingFaceEmbedding(model_name=model_name)
+        cache_folder = os.path.join(project_root, ".model_cache")
+        os.makedirs(cache_folder, exist_ok=True)
+        _EMBEDDING_CACHE[model_name] = HuggingFaceEmbedding(
+            model_name=model_name, 
+            cache_folder=cache_folder
+        )
     return _EMBEDDING_CACHE[model_name]
 
 class RAG:
@@ -47,26 +59,11 @@ class RAG:
         self.logger = app_logger
         self.logger.info("RAG engine initialized.")
         self.logger.info(f"LLM Provider: {ConfigSettings.llm_provider}")
-        if ConfigSettings.llm_provider == "ollama":
-            self.logger.info(f"Ollama Model: {ConfigSettings.ollama_model_name}")
-        else:
-            self.logger.info(f"Gemini Model: {ConfigSettings.gemini_model_name}")
+        self.logger.info(f"Model: {ConfigSettings.ollama_model_name}")
         self.logger.info(f"Embedding Model: {ConfigSettings.embedding_model_name}")
         self.logger.info(f"Persistence enabled: {ConfigSettings.persist_index}")
 
     def _build_llm(self):
-        provider = ConfigSettings.llm_provider.lower()
-        if provider == "ollama":
-            return self._build_ollama_llm()
-        elif provider == "gemini":
-            return Gemini(
-                model_name=ConfigSettings.gemini_model_name,
-                temperature=ConfigSettings.temperature,
-            )
-        else:
-            raise ValueError(f"Unsupported LLM provider: {provider}")
-
-    def _build_ollama_llm(self):
         return Ollama(
             model=ConfigSettings.ollama_model_name,
             temperature=ConfigSettings.temperature,
@@ -180,14 +177,17 @@ class RAG:
             
         return evidence_nodes
 
-    def generate_report_query(self, chat_history):
+    def generate_report_data(self, chat_history):
         if not self.index:
             raise ValueError("Document index has not been created.")
         if not chat_history:
             raise ValueError("Chat history is empty.")
 
-        self.logger.info("Generating final report.")
+        self.logger.info("Generating final report data.")
         
+        conversation_summary_text = self._get_conversation_summary(chat_history)
+        self.logger.info("Conversation summary generated.")
+
         retrieval_queries = self._get_retrieval_queries(chat_history)
         self.logger.info(f"Report retrieval queries generated: {len(retrieval_queries)}")
         
@@ -209,6 +209,23 @@ class RAG:
             nodes=evidence_nodes,
         )
         
-        response_text = getattr(response, "response", str(response))
+        insights_text = getattr(response, "response", str(response))
         self.logger.info("Report generation complete.")
-        return response_text
+        
+        return {
+            "summary": conversation_summary_text,
+            "insights": insights_text,
+        }
+
+    def _get_conversation_summary(self, chat_history):
+        limited_history = chat_history[-(ConfigSettings.history_turns * 2):]
+        conversation_text = "\n".join([f"- {m['role']}: {m['content']}" for m in limited_history])
+        
+        prompt = CONVERSATION_SUMMARY_PROMPT.format(conversation_summary=conversation_text)
+        
+        try:
+            response = self.llm.complete(prompt)
+            return getattr(response, "text", str(response))
+        except Exception as e:
+            self.logger.error(f"Failed to generate conversation summary: {e}")
+            return "Não foi possível gerar o resumo da conversa."

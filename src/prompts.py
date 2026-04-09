@@ -32,3 +32,10 @@ REPORT_QUERY_GENERATION_PROMPT = (
     "Retorne somente uma lista, uma consulta por linha, sem explicações.\n\n"
     "Histórico:\n{conversation_summary}"
 )
+
+CONVERSATION_SUMMARY_PROMPT = (
+    "Sua tarefa é criar um resumo conciso de uma conversa entre um usuário e um assistente de IA. "
+    "O resumo deve capturar os principais pontos, perguntas e respostas, sem exceder 250 palavras.\n\n"
+    "Histórico da Conversa:\n{conversation_summary}\n\n"
+    "Resumo Conciso:"
+)
