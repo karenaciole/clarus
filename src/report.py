@@ -1,13 +1,14 @@
-from fpdf import FPDF
+from fpdf import FPDF, HTMLMixin
 from datetime import datetime
 import sys
 from pathlib import Path
+from markdown_it import MarkdownIt
 
 project_root = Path(__file__).resolve().parents[1]
 if str(project_root) not in sys.path:
     sys.path.insert(0, str(project_root))
 
-class Report(FPDF):
+class Report(FPDF, HTMLMixin):
     def header(self):
         self.set_font("helvetica", "B", 12)
         self.cell(0, 10, "Relatório de Análise Técnica feito pelo Assistente Inteligente", border=False, ln=True, align="C")
@@ -19,6 +20,8 @@ class Report(FPDF):
         self.cell(0, 10, f"Página {self.page_no()}/{{nb}}", align="C")
 
 def generate_technical_report(chat_history, documents, insights, filename="relatorio_tecnico.pdf"):
+    md = MarkdownIt()
+
     def _to_text(value):
         if value is None:
             return ""
@@ -28,15 +31,9 @@ def generate_technical_report(chat_history, documents, insights, filename="relat
         except (UnicodeEncodeError, UnicodeDecodeError):
             return text.encode('utf-8', 'replace').decode('utf-8')
 
-    def _write_multiline(pdf_obj, text, line_height=6):
-        content_width = pdf_obj.w - pdf_obj.l_margin - pdf_obj.r_margin
-        pdf_obj.set_x(pdf_obj.l_margin)
-        pdf_obj.multi_cell(
-            content_width, 
-            line_height, 
-            _to_text(text), 
-            markdown=True
-        )
+    def _write_multiline(pdf_obj, text):
+        html = md.render(_to_text(text))
+        pdf_obj.write_html(html)
 
     pdf = Report()
     pdf.set_auto_page_break(auto=True, margin=15)
@@ -61,12 +58,12 @@ def generate_technical_report(chat_history, documents, insights, filename="relat
 
         if role == 'user':
             pdf.set_font("helvetica", "B", 10)
-            _write_multiline(pdf, f"Pergunta {question_number}: {content}", line_height=7)
+            _write_multiline(pdf, f"**Pergunta {question_number}:** {content}")
             question_number += 1
 
         elif role == 'assistant':
             pdf.set_font("helvetica", "", 10)
-            _write_multiline(pdf, f"Resposta: {content}", line_height=6)
+            _write_multiline(pdf, f"**Resposta:** {content}")
             pdf.ln(4)
 
     pdf.add_page()
@@ -75,7 +72,7 @@ def generate_technical_report(chat_history, documents, insights, filename="relat
     pdf.ln(2)
     
     pdf.set_font("helvetica", "", 10)
-    _write_multiline(pdf, insights, line_height=6)
+    _write_multiline(pdf, insights)
 
     pdf_data = pdf.output()
 
