@@ -3,5 +3,6 @@ data/
 *.log
 BRAG_DOCUMENT.md
 __pycache__/
+*.py[cod]
 *.pdf
 .model_cache/
