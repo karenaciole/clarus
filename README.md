@@ -17,7 +17,6 @@ Clarus is a RAG (Retrieval-Augmented Generation) system designed to assist in th
 
 -   Python 3.9+
 -   Pip (Python package installer)
--   An API key for Google Gemini (if you plan to use it).
 
 ### 2. Installation
 
@@ -42,9 +41,7 @@ Open the `.env` file and configure the variables as needed. Below is a descripti
 | Variable                  | Description                                                                          | Default                  |
 | ------------------------- | ------------------------------------------------------------------------------------ | ------------------------ |
 | `LLM_PROVIDER`            | The language model provider to use. Can be `ollama` or `gemini`.                     | `ollama`                 |
-| `OLLAMA_MODEL_NAME`       | The name of the model to use with Ollama (e.g., `mistral`, `llama2`).                  | `mistral`                |
-| `GEMINI_MODEL_NAME`       | The name of the model to use with Google Gemini.                                     | `gemini-1.5-flash`       |
-| `GEMINI_API_KEY`          | Your API key for Google Gemini.                                                      |                          |
+| `OLLAMA_MODEL_NAME`       | The name of the model to use with Ollama (e.g., `mistral`, `llama2`).                | `mistral`                |
 | `EMBEDDING_MODEL_NAME`    | The sentence-transformer model to use for embeddings.                                | `BAAI/bge-m3`            |
 | `CHUNK_SIZE`              | The size of text chunks (in tokens) for document indexing.                           | `512`                    |
 | `CHUNK_OVERLAP`           | The number of tokens to overlap between adjacent chunks.                             | `128`                    |

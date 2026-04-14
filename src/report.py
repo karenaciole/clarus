@@ -2,6 +2,7 @@ from fpdf import FPDF
 from datetime import datetime
 import sys
 from pathlib import Path
+from markdown_it import MarkdownIt
 
 project_root = Path(__file__).resolve().parents[1]
 if str(project_root) not in sys.path:
@@ -18,7 +19,9 @@ class Report(FPDF):
         self.set_font("helvetica", "I", 8)
         self.cell(0, 10, f"Página {self.page_no()}/{{nb}}", align="C")
 
-def generate_technical_report(chat_history, documents, insights, filename="relatorio_tecnico.pdf"):
+def generate_technical_report(report_data, documents, filename="relatorio_tecnico.pdf"):
+    md = MarkdownIt()
+
     def _to_text(value):
         if value is None:
             return ""
@@ -28,15 +31,9 @@ def generate_technical_report(chat_history, documents, insights, filename="relat
         except (UnicodeEncodeError, UnicodeDecodeError):
             return text.encode('utf-8', 'replace').decode('utf-8')
 
-    def _write_multiline(pdf_obj, text, line_height=6):
-        content_width = pdf_obj.w - pdf_obj.l_margin - pdf_obj.r_margin
-        pdf_obj.set_x(pdf_obj.l_margin)
-        pdf_obj.multi_cell(
-            content_width, 
-            line_height, 
-            _to_text(text), 
-            markdown=True
-        )
+    def _write_multiline(pdf_obj, text):
+        html = md.render(_to_text(text))
+        pdf_obj.write_html(html)
 
     pdf = Report()
     pdf.set_auto_page_break(auto=True, margin=15)
@@ -51,23 +48,12 @@ def generate_technical_report(chat_history, documents, insights, filename="relat
     pdf.ln(10)
 
     pdf.set_font("helvetica", "B", 14)
-    pdf.cell(0, 10, "Perguntas e Respostas Realizadas", ln=True)
+    pdf.cell(0, 10, "Resumo da Conversa", ln=True)
     pdf.ln(2)
     
-    question_number = 1
-    for chat in chat_history:
-        content = chat.get('content', '')
-        role = chat.get('role')
-
-        if role == 'user':
-            pdf.set_font("helvetica", "B", 10)
-            _write_multiline(pdf, f"Pergunta {question_number}: {content}", line_height=7)
-            question_number += 1
-
-        elif role == 'assistant':
-            pdf.set_font("helvetica", "", 10)
-            _write_multiline(pdf, f"Resposta: {content}", line_height=6)
-            pdf.ln(4)
+    pdf.set_font("helvetica", "", 10)
+    _write_multiline(pdf, report_data["summary"])
+    pdf.ln(4)
 
     pdf.add_page()
     pdf.set_font("helvetica", "B", 14)
@@ -75,7 +61,7 @@ def generate_technical_report(chat_history, documents, insights, filename="relat
     pdf.ln(2)
     
     pdf.set_font("helvetica", "", 10)
-    _write_multiline(pdf, insights, line_height=6)
+    _write_multiline(pdf, report_data["insights"])
 
     pdf_data = pdf.output()
 
