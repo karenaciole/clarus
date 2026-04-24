@@ -15,6 +15,8 @@ from config.logging_config import app_logger
 
 from src.engine import RAG
 from src.report import generate_technical_report
+from utils.check_perfomance import check_performance
+
 
 def _fingerprint_uploads(uploaded_files):
     """Creates a stable fingerprint for the set of uploaded files."""
@@ -52,6 +54,7 @@ def initialize_session_state():
             st.session_state[key] = value
     st.session_state.logger.info("Streamlit session initialized or reloaded.")
 
+
 def handle_file_uploads():
     """Manages file uploads and triggers document processing."""
     st.header("⚙️ Configurações")
@@ -70,6 +73,7 @@ def handle_file_uploads():
     if st.button("🚀 Processar Documentos", disabled=not uploaded_files):
         process_documents(uploaded_files)
 
+@check_performance
 def process_documents(uploaded_files):
     """Handles the logic of processing and indexing uploaded documents."""
     st.session_state.logger.info("Processing documents button clicked.")
@@ -101,6 +105,7 @@ def process_documents(uploaded_files):
             st.error(f"Falha ao processar documentos: {e}")
             st.session_state.logger.error(f"Error processing documents: {e}", exc_info=True)
 
+@check_performance
 def handle_report_generation():
     """Handles the final report generation and download."""
     st.divider()
@@ -131,6 +136,7 @@ def display_chat_history():
         with st.chat_message(message["role"]):
             st.markdown(message["content"])
 
+@check_performance
 def handle_chat_input():
     """Handles user input and assistant response."""
     if prompt := st.chat_input("Ex: Quais os principais riscos deste projeto?"):

@@ -1,0 +1,13 @@
+FROM python:3.11-slim
+
+WORKDIR /usr/src/app
+
+COPY requirements.txt .
+
+RUN pip install --upgrade pip setuptools wheel
+
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY . .
+
+CMD ["streamlit", "run", "ui/app.py", "--server.port=8501", "--server.address=0.0.0.0"]
