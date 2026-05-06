@@ -5,3 +5,11 @@ BRAG_DOCUMENT.md
 __pycache__/
 *.pdf
 .model_cache/
+.github/
+*/.venv/
+*/bin/
+*/cdk.out/
+*/lib/
+*/pyvenv.cfg
+*/__pycache__/
+*.pyc

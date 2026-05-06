@@ -16,6 +16,7 @@ from config.logging_config import app_logger
 from src.engine import RAG
 from src.report import generate_technical_report
 from utils.check_perfomance import check_performance
+from utils.s3_manager import S3Manager
 
 
 def _fingerprint_uploads(uploaded_files):
@@ -43,6 +44,7 @@ def initialize_session_state():
         "session_id": str(uuid.uuid4()),
         "chat_history": [],
         "rag_manager": RAG(),
+        "s3_manager": S3Manager(),
         "documents_ready": False,
         "indexed_doc_names": [],
         "uploaded_file_snapshots": {},
@@ -90,8 +92,11 @@ def process_documents(uploaded_files):
         os.makedirs(temp_dir, exist_ok=True)
         
         for f in uploaded_files:
+            bytes_data = f.getvalue()
             with open(os.path.join(temp_dir, f.name), "wb") as buffer:
-                buffer.write(f.getbuffer())
+                buffer.write(bytes_data)
+            
+            st.session_state.s3_manager.upload_bytes(bytes_data, f.name)
         
         try:
             documents = SimpleDirectoryReader(temp_dir).load_data()
@@ -166,6 +171,10 @@ def main():
     st.set_page_config(page_title="Clarus", layout="wide")
     
     initialize_session_state()
+
+    if st.session_state.rag_manager.initialization_error:
+        st.error(f"⚠️ Erro Crítico na Inicialização: {st.session_state.rag_manager.initialization_error}")
+        st.info("Verifique as credenciais do Banco de Dados e as permissões do Bedrock.")
 
     with st.sidebar:
         handle_file_uploads()

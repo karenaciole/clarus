@@ -1,0 +1,9 @@
+infra/
+.venv/
+__pycache__/
+.git/
+.cdk.staging/
+cdk.out/
+.env
+.env_example
+*.log

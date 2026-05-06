@@ -14,10 +14,12 @@ from llama_index.core import (
     load_index_from_storage,
     PromptTemplate,
 )
-from llama_index.llms.ollama import Ollama
-from llama_index.embeddings.huggingface import HuggingFaceEmbedding
+from llama_index.llms.bedrock import Bedrock
+from llama_index.embeddings.bedrock import BedrockEmbedding
+from llama_index.vector_stores.postgres import PGVectorStore
 from llama_index.core.node_parser import SentenceSplitter
 from llama_index.core.llms import ChatMessage
+import psycopg2
 from config.settings import Settings as ConfigSettings
 from config.logging_config import app_logger
 from src.prompts import (
@@ -27,48 +29,77 @@ from src.prompts import (
     CONVERSATION_SUMMARY_PROMPT
 )
 
+from utils.s3_manager import S3Manager
 from llama_index.core.response_synthesizers import get_response_synthesizer
-
-_EMBEDDING_CACHE = {}
-
-def _get_embed_model(model_name):
-    if model_name not in _EMBEDDING_CACHE:
-        cache_folder = os.path.join(project_root, ".model_cache")
-        os.makedirs(cache_folder, exist_ok=True)
-        _EMBEDDING_CACHE[model_name] = HuggingFaceEmbedding(
-            model_name=model_name, 
-            cache_folder=cache_folder
-        )
-    return _EMBEDDING_CACHE[model_name]
 
 class RAG:
     def __init__(self):
-        self.llm = self._build_llm()
-        self.embed_model = _get_embed_model(ConfigSettings.embedding_model_name)
-        
-        Settings.llm = self.llm
-        Settings.embed_model = self.embed_model
-        Settings.node_parser = SentenceSplitter(
-            chunk_size=ConfigSettings.chunk_size, 
-            chunk_overlap=ConfigSettings.chunk_overlap
-        )
-        
+        self.logger = app_logger
         self.index = None
         self.chat_engine = None
         self.query_engine = None
-        self.logger = app_logger
-        self.logger.info("RAG engine initialized.")
-        self.logger.info(f"LLM Provider: {ConfigSettings.llm_provider}")
-        self.logger.info(f"Model: {ConfigSettings.ollama_model_name}")
-        self.logger.info(f"Embedding Model: {ConfigSettings.embedding_model_name}")
-        self.logger.info(f"Persistence enabled: {ConfigSettings.persist_index}")
+        self.initialization_error = None
+        
+        try:
+            self.db_password = ConfigSettings.db_password
 
-    def _build_llm(self):
-        return Ollama(
-            model=ConfigSettings.ollama_model_name,
-            temperature=ConfigSettings.temperature,
-            request_timeout=ConfigSettings.request_timeout,
-        )
+            self._initialize_db()
+            
+            self.llm = Bedrock(
+                model=ConfigSettings.bedrock_llm_model,
+                region_name=ConfigSettings.bedrock_region,
+                temperature=ConfigSettings.temperature,
+                timeout=ConfigSettings.request_timeout,
+            )
+            
+            self.embed_model = BedrockEmbedding(
+                model=ConfigSettings.bedrock_embed_model,
+                region_name=ConfigSettings.bedrock_region,
+            )
+            
+            self.vector_store = PGVectorStore.from_params(
+                host=ConfigSettings.db_host,
+                port=ConfigSettings.db_port,
+                database=ConfigSettings.db_name,
+                user=ConfigSettings.db_user,
+                password=self.db_password,
+                table_name=ConfigSettings.vector_store_table,
+                embed_dim=1024,
+            )
+            
+            self.storage_context = StorageContext.from_defaults(vector_store=self.vector_store)
+            
+            Settings.llm = self.llm
+            Settings.embed_model = self.embed_model
+            Settings.node_parser = SentenceSplitter(
+                chunk_size=ConfigSettings.chunk_size, 
+                chunk_overlap=ConfigSettings.chunk_overlap
+            )
+            self.logger.info("RAG engine initialized successfully.")
+        except Exception as e:
+            self.logger.error(f"CRITICAL: Failed to initialize RAG engine: {e}")
+            self.initialization_error = str(e)
+
+    def _initialize_db(self):
+        """Ensure the pgvector extension is installed."""
+        try:
+            conn = psycopg2.connect(
+                host=ConfigSettings.db_host,
+                port=ConfigSettings.db_port,
+                database=ConfigSettings.db_name,
+                user=ConfigSettings.db_user,
+                password=self.db_password,
+                sslmode=ConfigSettings.db_sslmode
+            )
+            conn.autocommit = True
+
+            with conn.cursor() as cur:
+                cur.execute("CREATE EXTENSION IF NOT EXISTS vector;")
+            conn.close()
+            self.logger.info("Database extension 'vector' verified/installed.")
+        except Exception as e:
+            self.logger.error(f"Failed to initialize database: {e}")
+            raise e
 
     def _parse_retrieval_queries(self, llm_output: str) -> list[str]:
         lines = llm_output.strip().split("\n")
@@ -79,21 +110,18 @@ class RAG:
         ]
         return list(dict.fromkeys(queries))[:5]
 
-    def create_index(self, documents, index_persist_dir):
+    def create_index(self, documents, index_persist_dir=None):
+        if self.initialization_error:
+            raise ValueError(f"RAG Engine failed to initialize: {self.initialization_error}")
         if not documents:
             raise ValueError("Cannot create index from an empty list of documents.")
 
-        self.logger.info(f"Creating index from {len(documents)} documents.")
-        if ConfigSettings.persist_index and os.path.exists(index_persist_dir):
-            self.logger.info(f"Loading existing index from: {index_persist_dir}")
-            storage_context = StorageContext.from_defaults(persist_dir=index_persist_dir)
-            self.index = load_index_from_storage(storage_context)
-        else:
-            self.logger.info("Building new index.")
-            self.index = VectorStoreIndex.from_documents(documents)
-            if ConfigSettings.persist_index:
-                self.logger.info(f"Persisting index to: {index_persist_dir}")
-                self.index.storage_context.persist(persist_dir=index_persist_dir)
+        self.logger.info(f"Creating/Loading index for {len(documents)} documents in PGVector.")
+        self.index = VectorStoreIndex.from_documents(
+            documents, 
+            storage_context=self.storage_context,
+            show_progress=True
+        )
 
         self.chat_engine = self.index.as_chat_engine(
             chat_mode="condense_plus_context",
@@ -105,6 +133,8 @@ class RAG:
         )
 
     def query(self, query, chat_history=None):
+        if self.initialization_error:
+            raise ValueError(f"RAG Engine failed to initialize: {self.initialization_error}")
         if not self.chat_engine:
             raise ValueError("Document index has not been created. Please create the index before querying.")
         
@@ -178,6 +208,8 @@ class RAG:
         return evidence_nodes
 
     def generate_report_data(self, chat_history):
+        if self.initialization_error:
+            raise ValueError(f"RAG Engine failed to initialize: {self.initialization_error}")
         if not self.index:
             raise ValueError("Document index has not been created.")
         if not chat_history:
