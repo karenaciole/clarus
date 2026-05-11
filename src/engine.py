@@ -196,8 +196,6 @@ class RAG:
             raise ValueError(f"O motor RAG falhou ao iniciar: {self.initialization_error}")
         if not documents:
             raise ValueError("Lista de documentos vazia.")
-
-        # 1. Deduplicação por Hash (Economia de Créditos)
         existing_hashes = self._get_indexed_hashes()
         new_docs = [doc for doc in documents if doc.metadata.get("file_hash") not in existing_hashes]
 
@@ -213,14 +211,12 @@ class RAG:
                 embed_batch_size=10
             )
         
-        # 2. Garante que o índice aponte para o Vector Store (novo ou existente)
         if not self.index:
             self.index = VectorStoreIndex.from_vector_store(
                 self.vector_store,
                 storage_context=self.storage_context
             )
 
-        # 3. Inicializa os motores de chat e consulta
         self.chat_engine = self.index.as_chat_engine(
             chat_mode="condense_plus_context",
             system_prompt=SYSTEM_PROMPT,
@@ -251,20 +247,22 @@ class RAG:
 
         self.logger.info("Gerando dados para o relatório final...")
         
-        # Resumo da conversa
         conversation_text = "\n".join([f"- {m['role']}: {m['content']}" for m in chat_history[-10:]])
         summary_prompt = CONVERSATION_SUMMARY_PROMPT.format(conversation_summary=conversation_text)
         summary_resp = self.llm.complete(summary_prompt)
         summary_text = getattr(summary_resp, "text", str(summary_resp))
+        
+        query_gen_prompt = REPORT_QUERY_GENERATION_PROMPT.format(conversation_summary=summary_text)
+        queries_resp = self.llm.complete(query_gen_prompt)
+        search_queries = getattr(queries_resp, "text", str(queries_resp))
 
-        # Recuperação de Insights (Query Técnica)
         response_synthesizer = get_response_synthesizer(
             response_mode="tree_summarize",
             summary_template=PromptTemplate(REPORT_PROMPT_TEMPLATE),
         )
         
         query_engine = self.index.as_query_engine(response_synthesizer=response_synthesizer)
-        insights_resp = query_engine.query("Gere um relatório técnico com requisitos, riscos e recomendações.")
+        insights_resp = query_engine.query(search_queries)
         insights_text = getattr(insights_resp, "response", str(insights_resp))
 
         return {

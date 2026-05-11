@@ -198,9 +198,69 @@ def handle_chat_input():
                     st.error(f"Falha ao consultar o assistente: {e}")
                     st.session_state.logger.error(f"Failed to query the assistant: {e}", exc_info=True)
 
+def apply_custom_css():
+    """Injeta estilos CSS personalizados para um design premium (Clean Tech / Dark Mode)."""
+    st.markdown(
+        """
+        <style>
+        /* Importação da fonte Inter */
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600&display=swap');
+
+        /* Esconder UI padrão do Streamlit (Decluttering) */
+        #MainMenu {visibility: hidden;}
+        footer {visibility: hidden;}
+        header {visibility: hidden;}
+
+        /* Tipografia global */
+        html, body, [class*="css"] {
+            font-family: 'Inter', sans-serif;
+        }
+
+        /* Estilização dos Botões */
+        .stButton > button {
+            border-radius: 8px;
+            transition: all 0.2s ease-in-out;
+            font-weight: 600;
+            border: none;
+            box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -1px rgba(0, 0, 0, 0.06);
+        }
+        .stButton > button:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.1), 0 4px 6px -2px rgba(0, 0, 0, 0.05);
+            filter: brightness(1.1);
+        }
+
+        /* Balões de Chat (Glassmorphism sutil) */
+        .stChatMessage {
+            border-radius: 12px;
+            padding: 1.5rem;
+            margin-bottom: 1rem;
+            box-shadow: 0 1px 3px 0 rgba(0, 0, 0, 0.1), 0 1px 2px 0 rgba(0, 0, 0, 0.06);
+            border: 1px solid rgba(255, 255, 255, 0.05);
+        }
+        
+        /* Personalização do File Uploader */
+        .stFileUploader > div > div {
+            border-radius: 12px;
+            border-style: dashed;
+            border-color: #334155;
+            background-color: rgba(30, 41, 59, 0.5);
+            transition: border-color 0.2s ease;
+        }
+        .stFileUploader > div > div:hover {
+            border-color: #0D9488;
+        }
+
+        </style>
+        """,
+        unsafe_allow_html=True
+    )
+
 def main():
     """Main function to run the Streamlit app."""
-    st.set_page_config(page_title="Clarus", layout="wide")
+    st.set_page_config(page_title="Clarus", page_icon="✨", layout="wide")
+    
+    apply_custom_css()
     
     initialize_session_state()
 

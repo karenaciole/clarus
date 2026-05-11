@@ -4,14 +4,12 @@ import json
 import dotenv
 from pathlib import Path
 
-# --- SANITIZAÇÃO DE AMBIENTE ---
 forbidden_profiles = ["", "clarus-dev", "default"]
 if os.getenv("AWS_PROFILE") in forbidden_profiles:
     os.environ.pop("AWS_PROFILE", None)
 
 project_root = Path(__file__).resolve().parents[1]
 
-# Carrega o .env local apenas se existir
 env_path = project_root / ".env"
 if env_path.exists():
     dotenv.load_dotenv(dotenv_path=env_path, override=False)
@@ -22,7 +20,6 @@ def _get_env(name: str, default: str | None = None) -> str | None:
         return default
     return val.strip().strip("\"").strip("'")
 
-# Carrega configurações do segredo central se definido
 _config_data = {}
 _secret_id = _get_env("CONFIG_SECRET_ID")
 _region = _get_env("AWS_REGION", "us-east-1")
@@ -48,20 +45,16 @@ class Settings:
     Configurações Centralizadas da Aplicação.
     Acesso direto via atributos de classe (ex: Settings.llm_provider).
     """
-    # Provedor e Região
     llm_provider = _resolve("LLM_PROVIDER", "bedrock")
     aws_region = _resolve("AWS_REGION", "us-east-1")
     
-    # Bedrock Models
     bedrock_llm_model = _resolve("BEDROCK_LLM_MODEL", "anthropic.claude-3-haiku-20240307-v1:0")
     bedrock_embed_model = _resolve("BEDROCK_EMBED_MODEL", "amazon.titan-embed-text-v2:0")
     
-    # Google Gemini Configuration
     google_api_key = _resolve("GOOGLE_API_KEY")
     gemini_llm_model = _resolve("GEMINI_LLM_MODEL", "models/gemini-1.5-flash-lite")
     gemini_embed_model = _resolve("GEMINI_EMBED_MODEL", "models/text-embedding-004")
     
-    # Configurações de Banco de Dados
     db_host = _resolve("DB_HOST")
     db_port = int(_resolve("DB_PORT", "5432"))
     db_name = _resolve("DB_NAME", "clarus_db")
@@ -73,24 +66,20 @@ class Settings:
     
     embed_dim = int(_resolve("EMBED_DIM", "3072"))
 
-    # S3 Storage
     s3_bucket_name = _resolve("S3_BUCKET_NAME", "clarus-bucket")
     s3_prefix = _resolve("S3_PREFIX", "users/")
     s3_kms_key_arn = _resolve("S3_KMS_KEY_ARN")
 
-    # RAG Configs
     chunk_size = int(_resolve("CHUNK_SIZE", "512"))
     chunk_overlap = int(_resolve("CHUNK_OVERLAP", "128"))
     similarity_top_k = int(_resolve("SIMILARITY_TOP_K", "5"))
     similarity_cutoff = float(_resolve("SIMILARITY_CUTOFF", "0.0"))
     history_turns = int(_resolve("HISTORY_TURNS", "5"))
     
-    # Performance & LLM
     temperature = float(_resolve("DEFAULT_TEMPERATURE", "0.1"))
     request_timeout = float(_resolve("DEFAULT_REQUEST_TIMEOUT", "120.0"))
     persist_index = str(_resolve("PERSIST_INDEX", "true")).lower() in ("true", "1", "yes")
 
-    # Fallback para Segredo do Banco (Busca manual se senha estiver vazia)
     if db_secret_arn and not db_password:
         try:
             _client = boto3.client("secretsmanager", region_name=aws_region)
