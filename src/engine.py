@@ -1,6 +1,10 @@
 import os
 import sys
+import time
+import psycopg2
+import json
 from pathlib import Path
+from botocore.config import Config
 
 project_root = Path(__file__).resolve().parents[1]
 if str(project_root) not in sys.path:
@@ -16,10 +20,13 @@ from llama_index.core import (
 )
 from llama_index.llms.bedrock import Bedrock
 from llama_index.embeddings.bedrock import BedrockEmbedding
+from llama_index.llms.google_genai import GoogleGenAI
+from llama_index.embeddings.google_genai import GoogleGenAIEmbedding
 from llama_index.vector_stores.postgres import PGVectorStore
 from llama_index.core.node_parser import SentenceSplitter
 from llama_index.core.llms import ChatMessage
-import psycopg2
+from llama_index.core.response_synthesizers import get_response_synthesizer
+
 from config.settings import Settings as ConfigSettings
 from config.logging_config import app_logger
 from src.prompts import (
@@ -28,9 +35,6 @@ from src.prompts import (
     REPORT_QUERY_GENERATION_PROMPT,
     CONVERSATION_SUMMARY_PROMPT
 )
-
-from utils.s3_manager import S3Manager
-from llama_index.core.response_synthesizers import get_response_synthesizer
 
 class RAG:
     def __init__(self):
@@ -42,21 +46,81 @@ class RAG:
         
         try:
             self.db_password = ConfigSettings.db_password
-
             self._initialize_db()
             
-            self.llm = Bedrock(
-                model=ConfigSettings.bedrock_llm_model,
-                region_name=ConfigSettings.bedrock_region,
-                temperature=ConfigSettings.temperature,
-                timeout=ConfigSettings.request_timeout,
-            )
+            # --- Configuração Dinâmica do Provedor de IA ---
+            provider = ConfigSettings.llm_provider.lower()
             
-            self.embed_model = BedrockEmbedding(
-                model=ConfigSettings.bedrock_embed_model,
-                region_name=ConfigSettings.bedrock_region,
-            )
+            if provider == "gemini":
+                self.logger.info(f"🤖 Inicializando Provedor Moderno: GoogleGenAI ({ConfigSettings.gemini_llm_model})")
+                if not ConfigSettings.google_api_key:
+                    raise ValueError("GOOGLE_API_KEY não encontrada. Verifique o Secrets Manager.")
+                
+                self.llm = GoogleGenAI(
+                    model=ConfigSettings.gemini_llm_model,
+                    api_key=ConfigSettings.google_api_key,
+                    temperature=ConfigSettings.temperature,
+                )
+                self.embed_model = GoogleGenAIEmbedding(
+                    model_name=ConfigSettings.gemini_embed_model,
+                    api_key=ConfigSettings.google_api_key,
+                )
+                # A dimensão agora é acessada diretamente do atributo simplificado
+                embed_dim = ConfigSettings.embed_dim
+                
+                # Freio de Segurança / Workaround para Gemini (Evita KeyError de batch incompleto)
+                original_gemini_get_text_embeddings = self.embed_model._get_text_embeddings
+                def patched_gemini_get_text_embeddings(texts):
+                    res = original_gemini_get_text_embeddings(texts)
+                    if len(res) < len(texts):
+                        self.logger.warning(f"Gemini: Batch retornou {len(res)}/{len(texts)}. Fazendo fallback 1-a-1...")
+                        res = []
+                        for t in texts:
+                            try:
+                                if not t.strip():
+                                    res.append([0.0] * embed_dim)
+                                else:
+                                    res.append(self.embed_model.get_text_embedding(t))
+                            except Exception as e:
+                                self.logger.error(f"Erro no embedding 1-a-1: {e}")
+                                res.append([0.0] * embed_dim)
+                    return res
+                self.embed_model._get_text_embeddings = patched_gemini_get_text_embeddings
+
             
+            else:
+                self.logger.info("☁️ Inicializando Provedor: AWS Bedrock")
+                aws_config = Config(
+                    region_name=ConfigSettings.aws_region,
+                    retries={'max_attempts': 20, 'mode': 'adaptive'}
+                )
+
+                self.llm = Bedrock(
+                    model=ConfigSettings.bedrock_llm_model,
+                    region_name=ConfigSettings.aws_region,
+                    temperature=ConfigSettings.temperature,
+                    timeout=ConfigSettings.request_timeout,
+                    config=aws_config
+                )
+                self.embed_model = BedrockEmbedding(
+                    model=ConfigSettings.bedrock_embed_model,
+                    region_name=ConfigSettings.aws_region,
+                    config=aws_config
+                )
+                
+                # Freio de Segurança para Bedrock (Monkey-patching)
+                original_get_text_embeddings = self.embed_model._get_text_embeddings
+                def delayed_get_text_embeddings(texts):
+                    self.logger.info(f"Bedrock: Processando {len(texts)} textos com delay de segurança...")
+                    time.sleep(1.5)
+                    return original_get_text_embeddings(texts)
+                self.embed_model._get_text_embeddings = delayed_get_text_embeddings
+                
+                # Para Bedrock v2, se o usuário não configurou EMBED_DIM no secret, 
+                # garantimos 1024 como fallback lógico aqui, ou usamos o valor da classe.
+                embed_dim = ConfigSettings.embed_dim if ConfigSettings.embed_dim != 768 else 1024
+
+            # --- Conexão com o Vector Store ---
             self.vector_store = PGVectorStore.from_params(
                 host=ConfigSettings.db_host,
                 port=ConfigSettings.db_port,
@@ -64,24 +128,26 @@ class RAG:
                 user=ConfigSettings.db_user,
                 password=self.db_password,
                 table_name=ConfigSettings.vector_store_table,
-                embed_dim=1024,
+                embed_dim=embed_dim,
             )
             
             self.storage_context = StorageContext.from_defaults(vector_store=self.vector_store)
             
+            # Configurações Globais do LlamaIndex
             Settings.llm = self.llm
             Settings.embed_model = self.embed_model
             Settings.node_parser = SentenceSplitter(
                 chunk_size=ConfigSettings.chunk_size, 
                 chunk_overlap=ConfigSettings.chunk_overlap
             )
-            self.logger.info("RAG engine initialized successfully.")
+            self.logger.info(f"RAG engine inicializado com sucesso (Provedor: {provider}).")
+            
         except Exception as e:
-            self.logger.error(f"CRITICAL: Failed to initialize RAG engine: {e}")
+            self.logger.error(f"ERRO CRÍTICO na inicialização do RAG: {e}")
             self.initialization_error = str(e)
 
     def _initialize_db(self):
-        """Ensure the pgvector extension is installed."""
+        """Garante que a extensão pgvector esteja instalada no RDS."""
         try:
             conn = psycopg2.connect(
                 host=ConfigSettings.db_host,
@@ -92,37 +158,69 @@ class RAG:
                 sslmode=ConfigSettings.db_sslmode
             )
             conn.autocommit = True
-
             with conn.cursor() as cur:
                 cur.execute("CREATE EXTENSION IF NOT EXISTS vector;")
             conn.close()
-            self.logger.info("Database extension 'vector' verified/installed.")
+            self.logger.info("Extensão 'vector' verificada/instalada no banco de dados.")
         except Exception as e:
-            self.logger.error(f"Failed to initialize database: {e}")
+            self.logger.error(f"Falha ao conectar ou inicializar o banco: {e}")
             raise e
 
-    def _parse_retrieval_queries(self, llm_output: str) -> list[str]:
-        lines = llm_output.strip().split("\n")
-        queries = [
-            line.strip().lstrip("-*").lstrip("12345.").strip()
-            for line in lines
-            if len(line.strip()) > 8
-        ]
-        return list(dict.fromkeys(queries))[:5]
+    def _get_indexed_hashes(self):
+        """Busca no banco de dados os hashes de arquivos que já foram indexados."""
+        try:
+            conn = psycopg2.connect(
+                host=ConfigSettings.db_host,
+                port=ConfigSettings.db_port,
+                database=ConfigSettings.db_name,
+                user=ConfigSettings.db_user,
+                password=self.db_password,
+                sslmode=ConfigSettings.db_sslmode
+            )
+            hashes = set()
+            with conn.cursor() as cur:
+                cur.execute(f"SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_name = '{ConfigSettings.vector_store_table}');")
+                if cur.fetchone()[0]:
+                    cur.execute(f"SELECT DISTINCT (metadata_->>'file_hash') FROM {ConfigSettings.vector_store_table} WHERE metadata_->>'file_hash' IS NOT NULL;")
+                    rows = cur.fetchall()
+                    hashes = {r[0] for r in rows}
+            conn.close()
+            return hashes
+        except Exception as e:
+            self.logger.warning(f"Não foi possível recuperar hashes existentes: {e}")
+            return set()
 
     def create_index(self, documents, index_persist_dir=None):
+        """Cria ou carrega o índice, realizando deduplicação inteligente."""
         if self.initialization_error:
-            raise ValueError(f"RAG Engine failed to initialize: {self.initialization_error}")
+            raise ValueError(f"O motor RAG falhou ao iniciar: {self.initialization_error}")
         if not documents:
-            raise ValueError("Cannot create index from an empty list of documents.")
+            raise ValueError("Lista de documentos vazia.")
 
-        self.logger.info(f"Creating/Loading index for {len(documents)} documents in PGVector.")
-        self.index = VectorStoreIndex.from_documents(
-            documents, 
-            storage_context=self.storage_context,
-            show_progress=True
-        )
+        # 1. Deduplicação por Hash (Economia de Créditos)
+        existing_hashes = self._get_indexed_hashes()
+        new_docs = [doc for doc in documents if doc.metadata.get("file_hash") not in existing_hashes]
 
+        if not new_docs:
+            self.logger.info("♻️ Todos os documentos já estão no banco. Pulando chamadas de API de Embedding.")
+        else:
+            self.logger.info(f"🆕 Indexando {len(new_docs)} novos documentos.")
+            self.index = VectorStoreIndex.from_documents(
+                new_docs, 
+                storage_context=self.storage_context,
+                show_progress=True,
+                num_workers=1,
+                embed_batch_size=10
+            )
+        
+        # 2. Garante que o índice aponte para o Vector Store (novo ou existente)
+        if not self.index:
+            self.index = VectorStoreIndex.from_vector_store(
+                self.vector_store,
+                storage_context=self.storage_context
+            )
+
+        # 3. Inicializa os motores de chat e consulta
         self.chat_engine = self.index.as_chat_engine(
             chat_mode="condense_plus_context",
             system_prompt=SYSTEM_PROMPT,
@@ -133,131 +231,43 @@ class RAG:
         )
 
     def query(self, query, chat_history=None):
-        if self.initialization_error:
-            raise ValueError(f"RAG Engine failed to initialize: {self.initialization_error}")
+        """Realiza uma pergunta ao assistente usando o contexto dos documentos."""
         if not self.chat_engine:
-            raise ValueError("Document index has not been created. Please create the index before querying.")
+            raise ValueError("Índice não inicializado. Processe os documentos primeiro.")
         
         history_messages = [ChatMessage(role=m["role"], content=m["content"]) for m in chat_history]
         limited_history = history_messages[-ConfigSettings.history_turns:] if history_messages else []
         
-        if hasattr(self.chat_engine, "chat"):
-            response = self.chat_engine.chat(query, chat_history=limited_history)
-        else:
-            response = self.chat_engine.query(query) 
-
+        response = self.chat_engine.chat(query, chat_history=limited_history)
         response_text = getattr(response, "response", str(response))
-        self.logger.info(f"Query response: '{response_text[:100]}...'")
+        
+        self.logger.info(f"Resposta gerada ({len(response_text)} caracteres).")
         return response_text
 
-    def _get_retrieval_queries(self, chat_history):
-        limited_history = chat_history[-(ConfigSettings.history_turns * 2):]
-        conversation_summary = "\n".join([f"- {m['role']}: {m['content']}" for m in limited_history])
-
-        try:
-            generation_prompt = REPORT_QUERY_GENERATION_PROMPT.format(conversation_summary=conversation_summary)
-            query_gen_response = self.llm.complete(generation_prompt)
-            query_gen_text = getattr(query_gen_response, "text", str(query_gen_response))
-            
-            retrieval_queries = self._parse_retrieval_queries(query_gen_text)
-            if retrieval_queries:
-                return retrieval_queries
-
-        except Exception as exc:
-            self.logger.warning(f"Failed to generate retrieval queries from LLM. Using fallback. Error: {exc}")
-
-        return [
-            "Principais requisitos funcionais e não funcionais",
-            "Riscos técnicos e operacionais identificados",
-            "Recomendações e ações sugeridas",
-        ]
-
-    def _get_evidence_nodes(self, retrieval_queries):
-        retriever = self.index.as_retriever(
-            similarity_top_k=min(max(ConfigSettings.similarity_top_k, 4), 5)
-        )
-        
-        evidence_nodes = []
-        seen_keys = set()
-        max_evidence_nodes = 20
-
-        for rq in retrieval_queries:
-            try:
-                retrieved = retriever.retrieve(rq)
-                for node_with_score in retrieved:
-                    node = getattr(node_with_score, "node", None)
-                    if not node: continue
-                    
-                    key = node.node_id or node.get_content(metadata_mode="none")[:200]
-                    if key not in seen_keys:
-                        seen_keys.add(key)
-                        evidence_nodes.append(node_with_score)
-                    
-                    if len(evidence_nodes) >= max_evidence_nodes:
-                        break
-            except Exception as exc:
-                self.logger.warning(f"Failed to retrieve nodes for query '{rq}': {exc}")
-            
-            if len(evidence_nodes) >= max_evidence_nodes:
-                break
-        
-        if not evidence_nodes:
-            self.logger.warning("No evidence nodes found. Using fallback query.")
-            return retriever.retrieve("Resumo técnico com requisitos, riscos e recomendações.")
-            
-        return evidence_nodes
-
     def generate_report_data(self, chat_history):
-        if self.initialization_error:
-            raise ValueError(f"RAG Engine failed to initialize: {self.initialization_error}")
+        """Sintetiza as conclusões da conversa em um relatório estruturado."""
         if not self.index:
-            raise ValueError("Document index has not been created.")
-        if not chat_history:
-            raise ValueError("Chat history is empty.")
+            raise ValueError("Índice não disponível para gerar relatório.")
 
-        self.logger.info("Generating final report data.")
+        self.logger.info("Gerando dados para o relatório final...")
         
-        conversation_summary_text = self._get_conversation_summary(chat_history)
-        self.logger.info("Conversation summary generated.")
+        # Resumo da conversa
+        conversation_text = "\n".join([f"- {m['role']}: {m['content']}" for m in chat_history[-10:]])
+        summary_prompt = CONVERSATION_SUMMARY_PROMPT.format(conversation_summary=conversation_text)
+        summary_resp = self.llm.complete(summary_prompt)
+        summary_text = getattr(summary_resp, "text", str(summary_resp))
 
-        retrieval_queries = self._get_retrieval_queries(chat_history)
-        self.logger.info(f"Report retrieval queries generated: {len(retrieval_queries)}")
-        
-        evidence_nodes = self._get_evidence_nodes(retrieval_queries)
-        self.logger.info(f"Synthesizing report from {len(evidence_nodes)} evidence nodes.")
-
+        # Recuperação de Insights (Query Técnica)
         response_synthesizer = get_response_synthesizer(
             response_mode="tree_summarize",
             summary_template=PromptTemplate(REPORT_PROMPT_TEMPLATE),
-            use_async=False,
         )
+        
+        query_engine = self.index.as_query_engine(response_synthesizer=response_synthesizer)
+        insights_resp = query_engine.query("Gere um relatório técnico com requisitos, riscos e recomendações.")
+        insights_text = getattr(insights_resp, "response", str(insights_resp))
 
-        report_objective = (
-            "Gerar relatório final técnico, fiel aos documentos, cobrindo insights, "
-            "requisitos, riscos e recomendações."
-        )
-        response = response_synthesizer.synthesize(
-            query=report_objective,
-            nodes=evidence_nodes,
-        )
-        
-        insights_text = getattr(response, "response", str(response))
-        self.logger.info("Report generation complete.")
-        
         return {
-            "summary": conversation_summary_text,
+            "summary": summary_text,
             "insights": insights_text,
         }
-
-    def _get_conversation_summary(self, chat_history):
-        limited_history = chat_history[-(ConfigSettings.history_turns * 2):]
-        conversation_text = "\n".join([f"- {m['role']}: {m['content']}" for m in limited_history])
-        
-        prompt = CONVERSATION_SUMMARY_PROMPT.format(conversation_summary=conversation_text)
-        
-        try:
-            response = self.llm.complete(prompt)
-            return getattr(response, "text", str(response))
-        except Exception as e:
-            self.logger.error(f"Failed to generate conversation summary: {e}")
-            return "Não foi possível gerar o resumo da conversa."

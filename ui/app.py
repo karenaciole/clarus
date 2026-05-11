@@ -33,10 +33,19 @@ def _fingerprint_uploads(uploaded_files):
     return hasher.hexdigest()
 
 def _build_upload_snapshot(uploaded_files):
-    """Creates a snapshot of current file names and sizes."""
+    """Creates a snapshot of current file names, sizes, and content hashes."""
     if not uploaded_files:
         return {}
-    return {f.name: f.size for f in uploaded_files}
+    
+    snapshot = {}
+    for f in uploaded_files:
+        content = f.getvalue()
+        content_hash = hashlib.sha256(content).hexdigest()
+        snapshot[f.name] = {
+            "size": f.size,
+            "hash": content_hash
+        }
+    return snapshot
 
 def initialize_session_state():
     """Initializes the Streamlit session state with default values."""
@@ -60,6 +69,12 @@ def initialize_session_state():
 def handle_file_uploads():
     """Manages file uploads and triggers document processing."""
     st.header("⚙️ Configurações")
+    
+    # Indicador de Provedor de IA Ativo
+    provider = ConfigSettings.llm_provider.upper()
+    provider_icon = "🤖" if provider == "GEMINI" else "☁️"
+    st.caption(f"{provider_icon} Provedor Ativo: **{provider}**")
+    
     uploaded_files = st.file_uploader(
         "Upload de Documentos Técnicos",
         accept_multiple_files=True,
@@ -91,21 +106,38 @@ def process_documents(uploaded_files):
         st.session_state.logger.info("Starting document indexing.")
         os.makedirs(temp_dir, exist_ok=True)
         
+        valid_files = []
         for f in uploaded_files:
             bytes_data = f.getvalue()
             with open(os.path.join(temp_dir, f.name), "wb") as buffer:
                 buffer.write(bytes_data)
             
-            st.session_state.s3_manager.upload_bytes(bytes_data, f.name)
-        
+            if st.session_state.s3_manager.upload_bytes(bytes_data, f.name):
+                valid_files.append(f)
+            else:
+                st.error(f"Falha ao enviar '{f.name}' para o S3. O arquivo será ignorado.")
+
+        if not valid_files:
+            st.warning("Nenhum arquivo pôde ser processado.")
+            return
+
         try:
+            snapshots = _build_upload_snapshot(valid_files)
+            
             documents = SimpleDirectoryReader(temp_dir).load_data()
-            st.session_state.rag_manager.create_index(documents, index_persist_dir)
+            final_docs = []
+            for doc in documents:
+                file_name = doc.metadata.get("file_name")
+                if file_name in snapshots:
+                    doc.metadata["file_hash"] = snapshots[file_name]["hash"]
+                    final_docs.append(doc)
+
+            st.session_state.rag_manager.create_index(final_docs, index_persist_dir)
             st.session_state.documents_ready = True
             st.session_state.indexed_doc_names = [f.name for f in uploaded_files]
-            st.session_state.uploaded_file_snapshots = _build_upload_snapshot(uploaded_files)
+            st.session_state.uploaded_file_snapshots = snapshots
             st.success("Documentos prontos para análise!")
-            st.session_state.logger.info("Document indexing completed successfully.")
+            st.session_state.logger.info("Documenting indexing completed successfully.")
         except (ValueError, Exception) as e:
             st.error(f"Falha ao processar documentos: {e}")
             st.session_state.logger.error(f"Error processing documents: {e}", exc_info=True)

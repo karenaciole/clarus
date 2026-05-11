@@ -7,7 +7,7 @@ from config.logging_config import app_logger
 class S3Manager:
     def __init__(self):
         self.bucket_name = ConfigSettings.s3_bucket_name
-        self.region = ConfigSettings.bedrock_region
+        self.region = ConfigSettings.aws_region
         self.s3_client = boto3.client("s3", region_name=self.region)
         self.logger = app_logger
 
