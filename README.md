@@ -19,6 +19,15 @@ A infraestrutura é provisionada inteiramente via **AWS CDK** (presente no diret
 - **FinOps (Controle de Custo Automático):** Alarme no Amazon CloudWatch monitora o uso de CPU e envia um sinal de `STOP` para a instância EC2 caso ela fique ociosa, evitando custos.
 - **Segurança Nativa:** Nenhuma chave de API da AWS fica no código. A aplicação EC2 usa um *Instance Profile* (IAM Role) restrito, conectando-se ao Bedrock, S3 e Secrets Manager apenas com permissões necessárias de leitura. 
 
+## 🧠 Implementação do RAG
+
+O sistema RAG é orquestrado pela biblioteca **LlamaIndex** e adota boas práticas de engenharia de software aplicadas à IA:
+
+- **Ingestão Inteligente (Deduplicação):** Ao fazer o upload de documentos, o sistema gera um hash criptográfico (SHA-256). Antes de realizar as chamadas custosas para as APIs de Embedding (Bedrock ou Gemini), o banco vetorial verifica se o hash já foi indexado. Isso evita custos de token duplicados e "poluição" na base de conhecimento.
+- **Chunking e Resiliência de Vetorização:** Textos longos são quebrados em fragmentos (chunks) usando o `SentenceSplitter` preservando sobreposição semântica. A rotina implementa mecânicas de *delay* e *fallback* para tratar proativamente erros de "Rate Limit" e rejeição de lotes ao consumir embeddings externos.
+- **Contexto Isolado via Metadados:** Para evitar "vazamento de contexto" (alucinar respondendo com base em um relatório obsoleto em vez do documento em tela), o sistema injeta o hash do arquivo nos metadados do `pgvector`. Durante o chat, um Filtro de Metadados (`MetadataFilter`) restringe o sistema de forma rigorosa apenas aos arquivos da sessão atual.
+- **Síntese Estruturada (`Tree-Summarize`):** Ao gerar o relatório técnico, o sistema não faz apenas um resumo simples. O Clarus sintetiza o histórico da conversa no chat, cria sub-queries dinâmicas focadas nas necessidades demonstradas, e usa um algoritmo de sumarização em árvore (`Tree-Summarize`) para extrair os *insights* individualmente por documento de maneira controlada.
+
 ## 🚀 Como Executar Localmente
 
 ### 1. Pré-requisitos
