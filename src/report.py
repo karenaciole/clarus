@@ -16,7 +16,7 @@ class Report(FPDF):
         self.set_text_color(255, 255, 255)
         self.set_font("helvetica", "B", 14)
         self.set_y(8)
-        self.cell(0, 10, "Relatório Executivo de Inteligência Artificial | Clarus", align="C")
+        self.cell(0, 10, "Relatório", align="C")
         self.ln(20) 
         self.set_text_color(0, 0, 0) 
 
@@ -28,7 +28,7 @@ class Report(FPDF):
         self.set_draw_color(203, 213, 225) 
         self.line(15, self.get_y(), 195, self.get_y())
         
-        self.cell(0, 10, f"Página {self.page_no()}/{{nb}} - Gerado automaticamente via AWS & Google Gemini", align="C")
+        self.cell(0, 10, f"{self.page_no()}/{{nb}}", align="C")
 
 def generate_technical_report(report_data, documents, filename="relatorio_tecnico.pdf"):
     md = MarkdownIt('commonmark', {'breaks': True, 'html': True})
@@ -93,9 +93,16 @@ def generate_technical_report(report_data, documents, filename="relatorio_tecnic
     pdf.set_text_color(13, 148, 136)
     pdf.cell(0, 10, "2. Insights Técnicos e Recomendações", ln=True)
     
-    pdf.set_text_color(0, 0, 0)
-    pdf.set_font("helvetica", "", 11)
-    _write_multiline(pdf, report_data["insights"])
+    for doc_name, insights in report_data.get("insights_per_doc", {}).items():
+        pdf.ln(5)
+        pdf.set_font("helvetica", "B", 13)
+        pdf.set_text_color(71, 85, 105)
+        pdf.cell(0, 8, f"Documento: {doc_name}", ln=True)
+        
+        pdf.set_text_color(0, 0, 0)
+        pdf.set_font("helvetica", "", 11)
+        _write_multiline(pdf, insights)
+        pdf.ln(5)
 
     pdf_data = pdf.output()
 

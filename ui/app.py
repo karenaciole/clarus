@@ -70,7 +70,6 @@ def handle_file_uploads():
     """Manages file uploads and triggers document processing."""
     st.header("⚙️ Configurações")
     
-    # Indicador de Provedor de IA Ativo
     provider = ConfigSettings.llm_provider.upper()
     provider_icon = "🤖" if provider == "GEMINI" else "☁️"
     st.caption(f"{provider_icon} Provedor Ativo: **{provider}**")
@@ -150,7 +149,10 @@ def handle_report_generation():
         st.session_state.logger.info("Generate report button clicked.")
         with st.spinner("Sintetizando conclusões..."):
             try:
-                report_data = st.session_state.rag_manager.generate_report_data(st.session_state.chat_history)
+                report_data = st.session_state.rag_manager.generate_report_data(
+                    st.session_state.chat_history,
+                    document_snapshots=st.session_state.uploaded_file_snapshots
+                )
                 pdf_bytes = generate_technical_report(
                     report_data,
                     st.session_state.indexed_doc_names
@@ -199,7 +201,7 @@ def handle_chat_input():
                     st.session_state.logger.error(f"Failed to query the assistant: {e}", exc_info=True)
 
 def apply_custom_css():
-    """Injeta estilos CSS personalizados para um design premium (Clean Tech / Dark Mode)."""
+    """Injeta estilos CSS personalizados no streamlit"""
     st.markdown(
         """
         <style>
@@ -257,8 +259,7 @@ def apply_custom_css():
     )
 
 def main():
-    """Main function to run the Streamlit app."""
-    st.set_page_config(page_title="Clarus", page_icon="✨", layout="wide")
+    st.set_page_config(page_title="Clarus", page_icon="🕸️", layout="wide")
     
     apply_custom_css()
     
@@ -272,9 +273,9 @@ def main():
         handle_file_uploads()
         handle_report_generation()
 
-    st.title("📑 Assistente de Análise Técnica")
-    st.caption("Especialista em Requisitos, Riscos e Recomendações")
 
+    st.title("🕸️ Clarus: Assistente de Análise Documental")
+    st.caption("Faça upload dos seus documentos para extrair informações, cruzar dados com o histórico da base e gerar insights.")
     display_chat_history()
     handle_chat_input()
 

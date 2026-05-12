@@ -26,6 +26,7 @@ from llama_index.vector_stores.postgres import PGVectorStore
 from llama_index.core.node_parser import SentenceSplitter
 from llama_index.core.llms import ChatMessage
 from llama_index.core.response_synthesizers import get_response_synthesizer
+from llama_index.core.vector_stores import MetadataFilters, MetadataFilter, FilterOperator
 
 from config.settings import Settings as ConfigSettings
 from config.logging_config import app_logger
@@ -40,15 +41,12 @@ class RAG:
     def __init__(self):
         self.logger = app_logger
         self.index = None
-        self.chat_engine = None
-        self.query_engine = None
         self.initialization_error = None
         
         try:
             self.db_password = ConfigSettings.db_password
             self._initialize_db()
             
-            # --- Configuração Dinâmica do Provedor de IA ---
             provider = ConfigSettings.llm_provider.lower()
             
             if provider == "gemini":
@@ -65,17 +63,17 @@ class RAG:
                     model_name=ConfigSettings.gemini_embed_model,
                     api_key=ConfigSettings.google_api_key,
                 )
-                # A dimensão agora é acessada diretamente do atributo simplificado
                 embed_dim = ConfigSettings.embed_dim
                 
-                # Freio de Segurança / Workaround para Gemini (Evita KeyError de batch incompleto)
                 original_gemini_get_text_embeddings = self.embed_model._get_text_embeddings
                 def patched_gemini_get_text_embeddings(texts):
-                    res = original_gemini_get_text_embeddings(texts)
+                    formatted_texts = [f"title: none | text: {t}" if t.strip() else t for t in texts]
+                    
+                    res = original_gemini_get_text_embeddings(formatted_texts)
                     if len(res) < len(texts):
                         self.logger.warning(f"Gemini: Batch retornou {len(res)}/{len(texts)}. Fazendo fallback 1-a-1...")
                         res = []
-                        for t in texts:
+                        for t in formatted_texts:
                             try:
                                 if not t.strip():
                                     res.append([0.0] * embed_dim)
@@ -86,6 +84,12 @@ class RAG:
                                 res.append([0.0] * embed_dim)
                     return res
                 self.embed_model._get_text_embeddings = patched_gemini_get_text_embeddings
+
+                original_get_query_embedding = self.embed_model._get_query_embedding
+                def patched_get_query_embedding(query):
+                    formatted_query = f"task: search result | query: {query}"
+                    return original_get_query_embedding(formatted_query)
+                self.embed_model._get_query_embedding = patched_get_query_embedding
 
             
             else:
@@ -108,7 +112,6 @@ class RAG:
                     config=aws_config
                 )
                 
-                # Freio de Segurança para Bedrock (Monkey-patching)
                 original_get_text_embeddings = self.embed_model._get_text_embeddings
                 def delayed_get_text_embeddings(texts):
                     self.logger.info(f"Bedrock: Processando {len(texts)} textos com delay de segurança...")
@@ -116,11 +119,8 @@ class RAG:
                     return original_get_text_embeddings(texts)
                 self.embed_model._get_text_embeddings = delayed_get_text_embeddings
                 
-                # Para Bedrock v2, se o usuário não configurou EMBED_DIM no secret, 
-                # garantimos 1024 como fallback lógico aqui, ou usamos o valor da classe.
                 embed_dim = ConfigSettings.embed_dim if ConfigSettings.embed_dim != 768 else 1024
 
-            # --- Conexão com o Vector Store ---
             self.vector_store = PGVectorStore.from_params(
                 host=ConfigSettings.db_host,
                 port=ConfigSettings.db_port,
@@ -133,7 +133,6 @@ class RAG:
             
             self.storage_context = StorageContext.from_defaults(vector_store=self.vector_store)
             
-            # Configurações Globais do LlamaIndex
             Settings.llm = self.llm
             Settings.embed_model = self.embed_model
             Settings.node_parser = SentenceSplitter(
@@ -216,32 +215,60 @@ class RAG:
                 self.vector_store,
                 storage_context=self.storage_context
             )
-
-        self.chat_engine = self.index.as_chat_engine(
-            chat_mode="condense_plus_context",
-            system_prompt=SYSTEM_PROMPT,
-            similarity_top_k=ConfigSettings.similarity_top_k,
-        )
-        self.query_engine = self.index.as_query_engine(
-            similarity_top_k=ConfigSettings.similarity_top_k,
-        )
+            
+        self.current_hashes = list(set([doc.metadata.get("file_hash") for doc in documents if doc.metadata.get("file_hash")]))
 
     def query(self, query, chat_history=None):
         """Realiza uma pergunta ao assistente usando o contexto dos documentos."""
-        if not self.chat_engine:
+        if not self.index:
             raise ValueError("Índice não inicializado. Processe os documentos primeiro.")
+        
+        classification_prompt = (
+            "You are a helpful assistant classifying user queries.\n"
+            "The user is currently analyzing some recently uploaded documents.\n"
+            "Does the following query explicitly ask to search or reference 'old', 'previous', 'historical', or 'past' documents that are not in the current session?\n"
+            "Reply with exactly 'YES' or 'NO'.\n\n"
+            f"Query: {query}"
+        )
+        try:
+            resp = self.llm.complete(classification_prompt)
+            is_historical = "YES" in str(resp).upper()
+        except Exception as e:
+            self.logger.warning(f"Erro na classificação da query, assumindo falso: {e}")
+            is_historical = False
         
         history_messages = [ChatMessage(role=m["role"], content=m["content"]) for m in chat_history]
         limited_history = history_messages[-ConfigSettings.history_turns:] if history_messages else []
         
-        response = self.chat_engine.chat(query, chat_history=limited_history)
+        
+        filters = None
+        system_prompt = SYSTEM_PROMPT
+        
+        if is_historical:
+            system_prompt += "\n\nIMPORTANTE: O usuário perguntou explicitamente sobre documentos antigos/históricos. Você tem acesso a toda a base de dados. Ao responder, DEIXE CLARO que você precisou buscar no histórico e que está referenciando informações de documentos antigos/históricos armazenados no banco de dados."
+            self.logger.info("Query classificada como busca histórica (sem filtros).")
+        else:
+            if hasattr(self, 'current_hashes') and self.current_hashes:
+                filters = MetadataFilters(
+                    filters=[MetadataFilter(key="file_hash", value=self.current_hashes, operator=FilterOperator.IN)]
+                )
+            self.logger.info("Query classificada como busca na sessão atual (com filtros).")
+
+        temp_chat_engine = self.index.as_chat_engine(
+            chat_mode="condense_plus_context",
+            system_prompt=system_prompt,
+            similarity_top_k=ConfigSettings.similarity_top_k,
+            filters=filters
+        )
+        
+        response = temp_chat_engine.chat(query, chat_history=limited_history)
         response_text = getattr(response, "response", str(response))
         
         self.logger.info(f"Resposta gerada ({len(response_text)} caracteres).")
         return response_text
 
-    def generate_report_data(self, chat_history):
-        """Sintetiza as conclusões da conversa em um relatório estruturado."""
+    def generate_report_data(self, chat_history, document_snapshots=None):
+        """Sintetiza as conclusões da conversa em um relatório estruturado por documento."""
         if not self.index:
             raise ValueError("Índice não disponível para gerar relatório.")
 
@@ -261,11 +288,32 @@ class RAG:
             summary_template=PromptTemplate(REPORT_PROMPT_TEMPLATE),
         )
         
-        query_engine = self.index.as_query_engine(response_synthesizer=response_synthesizer)
-        insights_resp = query_engine.query(search_queries)
-        insights_text = getattr(insights_resp, "response", str(insights_resp))
+        insights_per_doc = {}
+        if document_snapshots:
+            for file_name, file_info in document_snapshots.items():
+                doc_hash = file_info["hash"]
+                filters = MetadataFilters(
+                    filters=[MetadataFilter(key="file_hash", value=doc_hash, operator=FilterOperator.EQ)]
+                )
+                query_engine = self.index.as_query_engine(
+                    response_synthesizer=response_synthesizer,
+                    filters=filters
+                )
+                insights_resp = query_engine.query(search_queries)
+                insights_per_doc[file_name] = getattr(insights_resp, "response", str(insights_resp))
+        else:
+            filters = MetadataFilters(
+                filters=[MetadataFilter(key="file_hash", value=self.current_hashes, operator=FilterOperator.IN)]
+            ) if hasattr(self, 'current_hashes') and self.current_hashes else None
+            
+            query_engine = self.index.as_query_engine(
+                response_synthesizer=response_synthesizer,
+                filters=filters
+            )
+            insights_resp = query_engine.query(search_queries)
+            insights_per_doc["Documentos Analisados"] = getattr(insights_resp, "response", str(insights_resp))
 
         return {
             "summary": summary_text,
-            "insights": insights_text,
+            "insights_per_doc": insights_per_doc,
         }
