@@ -1,4 +1,15 @@
 import os
+import sys
+import time
+import psycopg2
+import json
+from pathlib import Path
+from botocore.config import Config
+
+project_root = Path(__file__).resolve().parents[1]
+if str(project_root) not in sys.path:
+    sys.path.insert(0, str(project_root))
+
 from llama_index.core import (
     VectorStoreIndex,
     Settings,
@@ -7,240 +18,302 @@ from llama_index.core import (
     load_index_from_storage,
     PromptTemplate,
 )
-from llama_index.llms.ollama import Ollama
-from llama_index.llms.gemini import Gemini
-from llama_index.embeddings.huggingface import HuggingFaceEmbedding
+from llama_index.llms.bedrock import Bedrock
+from llama_index.embeddings.bedrock import BedrockEmbedding
+from llama_index.llms.google_genai import GoogleGenAI
+from llama_index.embeddings.google_genai import GoogleGenAIEmbedding
+from llama_index.vector_stores.postgres import PGVectorStore
 from llama_index.core.node_parser import SentenceSplitter
 from llama_index.core.llms import ChatMessage
+from llama_index.core.response_synthesizers import get_response_synthesizer
+from llama_index.core.vector_stores import MetadataFilters, MetadataFilter, FilterOperator
+
 from config.settings import Settings as ConfigSettings
 from config.logging_config import app_logger
-
-from llama_index.core.response_synthesizers import get_response_synthesizer
-
-_EMBEDDING_CACHE = {}
-
-def _get_embed_model(model_name):
-    if model_name not in _EMBEDDING_CACHE:
-        _EMBEDDING_CACHE[model_name] = HuggingFaceEmbedding(model_name=model_name)
-    return _EMBEDDING_CACHE[model_name]
+from src.prompts import (
+    SYSTEM_PROMPT, 
+    REPORT_PROMPT_TEMPLATE, 
+    REPORT_QUERY_GENERATION_PROMPT,
+    CONVERSATION_SUMMARY_PROMPT
+)
 
 class RAG:
     def __init__(self):
-        self.llm = self._build_llm()
-        self.embed_model = _get_embed_model(ConfigSettings.embedding_model_name)
-        
-        Settings.llm = self.llm
-        Settings.embed_model = self.embed_model
-        Settings.node_parser = SentenceSplitter(
-            chunk_size=ConfigSettings.chunk_size, 
-            chunk_overlap=ConfigSettings.chunk_overlap
-        )
-        
-        self.index = None
-        self.chat_engine = None
-        self.query_engine = None
         self.logger = app_logger
-        self.logger.info("RAG engine initialized.")
-        self.logger.info(f"LLM Provider: {ConfigSettings.llm_provider}")
-        if ConfigSettings.llm_provider == "ollama":
-            self.logger.info(f"Ollama Model: {ConfigSettings.ollama_model_name}")
-        else:
-            self.logger.info(f"Gemini Model: {ConfigSettings.gemini_model_name}")
-        self.logger.info(f"Embedding Model: {ConfigSettings.embedding_model_name}")
-        self.logger.info(f"Persistence enabled: {ConfigSettings.persist_index}")
+        self.index = None
+        self.initialization_error = None
+        
+        try:
+            self.db_password = ConfigSettings.db_password
+            self._initialize_db()
+            
+            provider = ConfigSettings.llm_provider.lower()
+            
+            if provider == "gemini":
+                self.logger.info(f"🤖 Inicializando Provedor Moderno: GoogleGenAI ({ConfigSettings.gemini_llm_model})")
+                if not ConfigSettings.google_api_key:
+                    raise ValueError("GOOGLE_API_KEY não encontrada. Verifique o Secrets Manager.")
+                
+                self.llm = GoogleGenAI(
+                    model=ConfigSettings.gemini_llm_model,
+                    api_key=ConfigSettings.google_api_key,
+                    temperature=ConfigSettings.temperature,
+                )
+                self.embed_model = GoogleGenAIEmbedding(
+                    model_name=ConfigSettings.gemini_embed_model,
+                    api_key=ConfigSettings.google_api_key,
+                )
+                embed_dim = ConfigSettings.embed_dim
+                
+                original_gemini_get_text_embeddings = self.embed_model._get_text_embeddings
+                def patched_gemini_get_text_embeddings(texts):
+                    formatted_texts = [f"title: none | text: {t}" if t.strip() else t for t in texts]
+                    
+                    res = original_gemini_get_text_embeddings(formatted_texts)
+                    if len(res) < len(texts):
+                        self.logger.warning(f"Gemini: Batch retornou {len(res)}/{len(texts)}. Fazendo fallback 1-a-1...")
+                        res = []
+                        for t in formatted_texts:
+                            try:
+                                if not t.strip():
+                                    res.append([0.0] * embed_dim)
+                                else:
+                                    res.append(self.embed_model.get_text_embedding(t))
+                            except Exception as e:
+                                self.logger.error(f"Erro no embedding 1-a-1: {e}")
+                                res.append([0.0] * embed_dim)
+                    return res
+                self.embed_model._get_text_embeddings = patched_gemini_get_text_embeddings
 
-    def _build_llm(self):
-        provider = ConfigSettings.llm_provider.lower()
-        if provider == "ollama":
-            return self._build_ollama_llm()
-        elif provider == "gemini":
-            return Gemini(
-                model_name=ConfigSettings.gemini_model_name,
-                temperature=ConfigSettings.temperature,
+                original_get_query_embedding = self.embed_model._get_query_embedding
+                def patched_get_query_embedding(query):
+                    formatted_query = f"task: search result | query: {query}"
+                    return original_get_query_embedding(formatted_query)
+                self.embed_model._get_query_embedding = patched_get_query_embedding
+
+            
+            else:
+                self.logger.info("☁️ Inicializando Provedor: AWS Bedrock")
+                aws_config = Config(
+                    region_name=ConfigSettings.aws_region,
+                    retries={'max_attempts': 20, 'mode': 'adaptive'}
+                )
+
+                self.llm = Bedrock(
+                    model=ConfigSettings.bedrock_llm_model,
+                    region_name=ConfigSettings.aws_region,
+                    temperature=ConfigSettings.temperature,
+                    timeout=ConfigSettings.request_timeout,
+                    config=aws_config
+                )
+                self.embed_model = BedrockEmbedding(
+                    model=ConfigSettings.bedrock_embed_model,
+                    region_name=ConfigSettings.aws_region,
+                    config=aws_config
+                )
+                
+                original_get_text_embeddings = self.embed_model._get_text_embeddings
+                def delayed_get_text_embeddings(texts):
+                    self.logger.info(f"Bedrock: Processando {len(texts)} textos com delay de segurança...")
+                    time.sleep(1.5)
+                    return original_get_text_embeddings(texts)
+                self.embed_model._get_text_embeddings = delayed_get_text_embeddings
+                
+                embed_dim = ConfigSettings.embed_dim if ConfigSettings.embed_dim != 768 else 1024
+
+            self.vector_store = PGVectorStore.from_params(
+                host=ConfigSettings.db_host,
+                port=ConfigSettings.db_port,
+                database=ConfigSettings.db_name,
+                user=ConfigSettings.db_user,
+                password=self.db_password,
+                table_name=ConfigSettings.vector_store_table,
+                embed_dim=embed_dim,
             )
-        else:
-            raise ValueError(f"Unsupported LLM provider: {provider}")
+            
+            self.storage_context = StorageContext.from_defaults(vector_store=self.vector_store)
+            
+            Settings.llm = self.llm
+            Settings.embed_model = self.embed_model
+            Settings.node_parser = SentenceSplitter(
+                chunk_size=ConfigSettings.chunk_size, 
+                chunk_overlap=ConfigSettings.chunk_overlap
+            )
+            self.logger.info(f"RAG engine inicializado com sucesso (Provedor: {provider}).")
+            
+        except Exception as e:
+            self.logger.error(f"ERRO CRÍTICO na inicialização do RAG: {e}")
+            self.initialization_error = str(e)
 
-    def _build_ollama_llm(self):
-        return Ollama(
-            model=ConfigSettings.ollama_model_name,
-            temperature=ConfigSettings.temperature,
-            request_timeout=ConfigSettings.request_timeout,
-        )
+    def _initialize_db(self):
+        """Garante que a extensão pgvector esteja instalada no RDS."""
+        try:
+            conn = psycopg2.connect(
+                host=ConfigSettings.db_host,
+                port=ConfigSettings.db_port,
+                database=ConfigSettings.db_name,
+                user=ConfigSettings.db_user,
+                password=self.db_password,
+                sslmode=ConfigSettings.db_sslmode
+            )
+            conn.autocommit = True
+            with conn.cursor() as cur:
+                cur.execute("CREATE EXTENSION IF NOT EXISTS vector;")
+            conn.close()
+            self.logger.info("Extensão 'vector' verificada/instalada no banco de dados.")
+        except Exception as e:
+            self.logger.error(f"Falha ao conectar ou inicializar o banco: {e}")
+            raise e
 
-    def _build_system_prompt(self):
-        return (
-            "Você é o Clarus, um assistente de análise técnica de documentos. Sua comunicação deve ser sempre em Português (Brasil).\n\n"
-            "**Sua Missão Principal:**\n"
-            "Responder às perguntas do usuário de forma precisa e objetiva, baseando-se **exclusivamente** no conteúdo dos documentos fornecidos como contexto. Não utilize conhecimento prévio ou informações externas.\n\n"
-            "**Diretrizes de Resposta:**\n"
-            "1. **Fidelidade ao Contexto**: Se a resposta para uma pergunta não estiver nos documentos, afirme claramente: 'Com base nos documentos fornecidos, não encontrei informações sobre este tópico.'\n"
-            "2. **Clareza e Organização**: Apresente as respostas de forma clara. Use listas (bullet points) para detalhar informações e **negrito** para destacar termos e conceitos importantes.\n"
-            "3. **Tom Profissional**: Mantenha um tom profissional e direto, focando em fornecer informações úteis e precisas."
-        )
+    def _get_indexed_hashes(self):
+        """Busca no banco de dados os hashes de arquivos que já foram indexados."""
+        try:
+            conn = psycopg2.connect(
+                host=ConfigSettings.db_host,
+                port=ConfigSettings.db_port,
+                database=ConfigSettings.db_name,
+                user=ConfigSettings.db_user,
+                password=self.db_password,
+                sslmode=ConfigSettings.db_sslmode
+            )
+            hashes = set()
+            with conn.cursor() as cur:
+                cur.execute(f"SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_name = '{ConfigSettings.vector_store_table}');")
+                if cur.fetchone()[0]:
+                    cur.execute(f"SELECT DISTINCT (metadata_->>'file_hash') FROM {ConfigSettings.vector_store_table} WHERE metadata_->>'file_hash' IS NOT NULL;")
+                    rows = cur.fetchall()
+                    hashes = {r[0] for r in rows}
+            conn.close()
+            return hashes
+        except Exception as e:
+            self.logger.warning(f"Não foi possível recuperar hashes existentes: {e}")
+            return set()
 
-    def _build_report_prompt_template(self):
-        return (
-            "Você é um assistente técnico sênior, especializado em compilar relatórios de análise detalhados. "
-            "Sua tarefa é sintetizar a conversa e os documentos fornecidos em um relatório final estruturado.\n\n"
-            "Use APENAS as informações presentes no CONTEXTO recuperado abaixo.\n"
-            "Se alguma informação não estiver no contexto, declare explicitamente que não há evidência suficiente.\n\n"
-            "Objetivo da síntese:\n{query_str}\n\n"
-            "CONTEXTO RECUPERADO:\n{context_str}\n\n"
-            "Com base no contexto acima, elabore um texto estruturado contendo:\n"
-            "1.  **Principais Insights**: Um resumo dos pontos mais importantes discutidos.\n"
-            "2.  **Identificação de Requisitos**: Liste todos os requisitos funcionais e não funcionais mencionados.\n"
-            "3.  **Análise de Riscos**: Identifique e descreva os potenciais riscos técnicos, operacionais e de negócio.\n"
-            "4.  **Sugestão de Recomendações**: Proponha recomendações claras e acionáveis para mitigar os riscos e atender aos requisitos.\n\n"
-            "**Formato da Resposta**: Apresente a resposta de forma organizada, utilizando seções distintas para cada um dos pontos acima.\n"
-            "**Idioma**: Responda sempre em Português (Brasil), com um tom profissional e direto.\n"
-            "**Fidelidade ao Contexto**: Baseie-se exclusivamente nas informações contidas no histórico da conversa e nos documentos."
-        )
-
-    def _build_report_query_generation_prompt(self, conversation_summary):
-        return (
-            "Você receberá um histórico de conversa sobre análise técnica de documentos.\n"
-            "Gere entre 3 e 5 consultas curtas e objetivas para recuperar evidências dos documentos.\n"
-            "As consultas devem cobrir: requisitos, riscos, decisões, dependências, restrições e recomendações.\n"
-            "Retorne somente uma lista, uma consulta por linha, sem explicações.\n\n"
-            f"Histórico:\n{conversation_summary}"
-        )
-
-    def _parse_retrieval_queries(self, llm_output):
-        queries = []
-        for raw_line in llm_output.splitlines():
-            line = raw_line.strip().lstrip("-*").strip()
-            if not line:
-                continue
-            if line[0].isdigit() and "." in line:
-                first_dot = line.find(".")
-                if first_dot > 0:
-                    line = line[first_dot + 1 :].strip()
-            if len(line) >= 8:
-                queries.append(line)
-        unique = list(dict.fromkeys(queries))
-        return unique[:5]
-
-    def create_index(self, documents, index_persist_dir):
+    def create_index(self, documents, index_persist_dir=None):
+        """Cria ou carrega o índice, realizando deduplicação inteligente."""
+        if self.initialization_error:
+            raise ValueError(f"O motor RAG falhou ao iniciar: {self.initialization_error}")
         if not documents:
-            raise ValueError("Cannot create index from an empty list of documents.")
+            raise ValueError("Lista de documentos vazia.")
+        existing_hashes = self._get_indexed_hashes()
+        new_docs = [doc for doc in documents if doc.metadata.get("file_hash") not in existing_hashes]
 
-        self.logger.info(f"Creating index from {len(documents)} documents.")
-        if ConfigSettings.persist_index and os.path.exists(index_persist_dir):
-            self.logger.info(f"Loading existing index from: {index_persist_dir}")
-            storage_context = StorageContext.from_defaults(persist_dir=index_persist_dir)
-            self.index = load_index_from_storage(storage_context)
+        if not new_docs:
+            self.logger.info("♻️ Todos os documentos já estão no banco. Pulando chamadas de API de Embedding.")
         else:
-            self.logger.info("Building new index.")
-            self.index = VectorStoreIndex.from_documents(documents)
-            if ConfigSettings.persist_index:
-                self.logger.info(f"Persisting index to: {index_persist_dir}")
-                self.index.storage_context.persist(persist_dir=index_persist_dir)
-
-        self.chat_engine = self.index.as_chat_engine(
-            chat_mode="condense_plus_context",
-            system_prompt=self._build_system_prompt(),
-            similarity_top_k=ConfigSettings.similarity_top_k,
-        )
-        self.query_engine = self.index.as_query_engine(
-            similarity_top_k=ConfigSettings.similarity_top_k,
-        )
+            self.logger.info(f"🆕 Indexando {len(new_docs)} novos documentos.")
+            self.index = VectorStoreIndex.from_documents(
+                new_docs, 
+                storage_context=self.storage_context,
+                show_progress=True,
+                num_workers=1,
+                embed_batch_size=10
+            )
+        
+        if not self.index:
+            self.index = VectorStoreIndex.from_vector_store(
+                self.vector_store,
+                storage_context=self.storage_context
+            )
+            
+        self.current_hashes = list(set([doc.metadata.get("file_hash") for doc in documents if doc.metadata.get("file_hash")]))
 
     def query(self, query, chat_history=None):
-        if not self.chat_engine:
-            raise ValueError("Document index has not been created. Please create the index before querying.")
+        """Realiza uma pergunta ao assistente usando o contexto dos documentos."""
+        if not self.index:
+            raise ValueError("Índice não inicializado. Processe os documentos primeiro.")
+        
+        classification_prompt = (
+            "You are a helpful assistant classifying user queries.\n"
+            "The user is currently analyzing some recently uploaded documents.\n"
+            "Does the following query explicitly ask to search or reference 'old', 'previous', 'historical', or 'past' documents that are not in the current session?\n"
+            "Reply with exactly 'YES' or 'NO'.\n\n"
+            f"Query: {query}"
+        )
+        try:
+            resp = self.llm.complete(classification_prompt)
+            is_historical = "YES" in str(resp).upper()
+        except Exception as e:
+            self.logger.warning(f"Erro na classificação da query, assumindo falso: {e}")
+            is_historical = False
         
         history_messages = [ChatMessage(role=m["role"], content=m["content"]) for m in chat_history]
         limited_history = history_messages[-ConfigSettings.history_turns:] if history_messages else []
         
-        if hasattr(self.chat_engine, "chat"):
-            response = self.chat_engine.chat(query, chat_history=limited_history)
+        
+        filters = None
+        system_prompt = SYSTEM_PROMPT
+        
+        if is_historical:
+            system_prompt += "\n\nIMPORTANTE: O usuário perguntou explicitamente sobre documentos antigos/históricos. Você tem acesso a toda a base de dados. Ao responder, DEIXE CLARO que você precisou buscar no histórico e que está referenciando informações de documentos antigos/históricos armazenados no banco de dados."
+            self.logger.info("Query classificada como busca histórica (sem filtros).")
         else:
-            response = self.chat_engine.query(query) 
+            if hasattr(self, 'current_hashes') and self.current_hashes:
+                filters = MetadataFilters(
+                    filters=[MetadataFilter(key="file_hash", value=self.current_hashes, operator=FilterOperator.IN)]
+                )
+            self.logger.info("Query classificada como busca na sessão atual (com filtros).")
 
+        temp_chat_engine = self.index.as_chat_engine(
+            chat_mode="condense_plus_context",
+            system_prompt=system_prompt,
+            similarity_top_k=ConfigSettings.similarity_top_k,
+            filters=filters
+        )
+        
+        response = temp_chat_engine.chat(query, chat_history=limited_history)
         response_text = getattr(response, "response", str(response))
-        self.logger.info(f"Query response: '{response_text[:100]}...'")
+        
+        self.logger.info(f"Resposta gerada ({len(response_text)} caracteres).")
         return response_text
 
-    def generate_report_query(self, chat_history):
+    def generate_report_data(self, chat_history, document_snapshots=None):
+        """Sintetiza as conclusões da conversa em um relatório estruturado por documento."""
         if not self.index:
-            raise ValueError("Document index has not been created. Please create the index before querying.")
-        if not chat_history:
-            raise ValueError("Chat history is empty. Start a conversation before generating the report.")
+            raise ValueError("Índice não disponível para gerar relatório.")
 
-        self.logger.info("Generating final report.")
-
-        report_prompt_template = PromptTemplate(self._build_report_prompt_template())
-
-        limited_history = chat_history[-(ConfigSettings.history_turns * 2):]
-        conversation_summary = "\n".join([f"- {m['role']}: {m['content']}" for m in limited_history])
-
-        retrieval_queries = []
-        try:
-            generation_prompt = self._build_report_query_generation_prompt(conversation_summary)
-            query_gen_response = self.llm.complete(generation_prompt)
-            query_gen_text = getattr(query_gen_response, "text", str(query_gen_response))
-            retrieval_queries = self._parse_retrieval_queries(query_gen_text)
-        except Exception as exc:
-            self.logger.warning(f"Failed to generate retrieval queries from LLM. Using fallback queries. Error: {exc}")
-
-        if not retrieval_queries:
-            retrieval_queries = [
-                "Principais requisitos funcionais e não funcionais",
-                "Riscos técnicos e operacionais identificados",
-                "Recomendações e ações sugeridas",
-            ]
-
-        self.logger.info(f"Report retrieval queries generated: {len(retrieval_queries)}")
-
-        retriever = self.index.as_retriever(
-            similarity_top_k=min(max(ConfigSettings.similarity_top_k, 4), 5)
-        )
-        evidence_nodes = []
-        seen_keys = set()
-        max_evidence_nodes = 20
-        for rq in retrieval_queries:
-            try:
-                nodes = retriever.retrieve(rq)
-            except Exception as exc:
-                self.logger.warning(f"Failed to retrieve nodes for query '{rq}': {exc}")
-                continue
-
-            for node_with_score in nodes:
-                node = getattr(node_with_score, "node", None)
-                node_id = getattr(node, "node_id", None)
-                text = ""
-                if node is not None and hasattr(node, "get_content"):
-                    text = node.get_content(metadata_mode="none")[:200]
-                key = node_id or text
-                if key and key not in seen_keys:
-                    seen_keys.add(key)
-                    evidence_nodes.append(node_with_score)
-                if len(evidence_nodes) >= max_evidence_nodes:
-                    break
-            if len(evidence_nodes) >= max_evidence_nodes:
-                break
-
-        if not evidence_nodes:
-            self.logger.warning("No evidence nodes found with generated retrieval queries. Using fallback query.")
-            evidence_nodes = retriever.retrieve("Resumo técnico com requisitos, riscos e recomendações.")
+        self.logger.info("Gerando dados para o relatório final...")
+        
+        conversation_text = "\n".join([f"- {m['role']}: {m['content']}" for m in chat_history[-10:]])
+        summary_prompt = CONVERSATION_SUMMARY_PROMPT.format(conversation_summary=conversation_text)
+        summary_resp = self.llm.complete(summary_prompt)
+        summary_text = getattr(summary_resp, "text", str(summary_resp))
+        
+        query_gen_prompt = REPORT_QUERY_GENERATION_PROMPT.format(conversation_summary=summary_text)
+        queries_resp = self.llm.complete(query_gen_prompt)
+        search_queries = getattr(queries_resp, "text", str(queries_resp))
 
         response_synthesizer = get_response_synthesizer(
             response_mode="tree_summarize",
-            summary_template=report_prompt_template,
-            use_async=False,
-        )
-
-        report_objective = (
-            "Gerar relatório final técnico, fiel aos documentos, cobrindo insights, "
-            "requisitos, riscos e recomendações."
-        )
-        self.logger.info(f"Synthesizing report from {len(evidence_nodes)} evidence nodes.")
-        response = response_synthesizer.synthesize(
-            query=report_objective,
-            nodes=evidence_nodes,
+            summary_template=PromptTemplate(REPORT_PROMPT_TEMPLATE),
         )
         
-        response_text = getattr(response, "response", str(response))
-        self.logger.info("Report generation complete.")
-        return response_text
+        insights_per_doc = {}
+        if document_snapshots:
+            for file_name, file_info in document_snapshots.items():
+                doc_hash = file_info["hash"]
+                filters = MetadataFilters(
+                    filters=[MetadataFilter(key="file_hash", value=doc_hash, operator=FilterOperator.EQ)]
+                )
+                query_engine = self.index.as_query_engine(
+                    response_synthesizer=response_synthesizer,
+                    filters=filters
+                )
+                insights_resp = query_engine.query(search_queries)
+                insights_per_doc[file_name] = getattr(insights_resp, "response", str(insights_resp))
+        else:
+            filters = MetadataFilters(
+                filters=[MetadataFilter(key="file_hash", value=self.current_hashes, operator=FilterOperator.IN)]
+            ) if hasattr(self, 'current_hashes') and self.current_hashes else None
+            
+            query_engine = self.index.as_query_engine(
+                response_synthesizer=response_synthesizer,
+                filters=filters
+            )
+            insights_resp = query_engine.query(search_queries)
+            insights_per_doc["Documentos Analisados"] = getattr(insights_resp, "response", str(insights_resp))
+
+        return {
+            "summary": summary_text,
+            "insights_per_doc": insights_per_doc,
+        }
