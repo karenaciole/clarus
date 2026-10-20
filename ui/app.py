@@ -9,11 +9,12 @@ import streamlit as st
 import os
 import uuid
 import hashlib
-from llama_index.core import SimpleDirectoryReader
 from config.settings import Settings as ConfigSettings
 from config.logging_config import app_logger
 
+from src.agent import build_agent, run_agent
 from src.engine import RAG
+from src.loaders import SUPPORTED_EXTENSIONS, load_documents
 from src.report import generate_technical_report
 from utils.check_perfomance import check_performance
 from utils.s3_manager import S3Manager
@@ -59,6 +60,8 @@ def initialize_session_state():
         "uploaded_file_snapshots": {},
         "uploaded_files_fingerprint": None,
         "logger": app_logger,
+        "agent_mode": False,
+        "agent": None,
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -77,7 +80,7 @@ def handle_file_uploads():
     uploaded_files = st.file_uploader(
         "Upload de Documentos Técnicos",
         accept_multiple_files=True,
-        type=['pdf', 'docx', 'txt']
+        type=[ext.lstrip('.') for ext in SUPPORTED_EXTENSIONS]
     )
 
     current_fingerprint = _fingerprint_uploads(uploaded_files)
@@ -88,6 +91,16 @@ def handle_file_uploads():
 
     if st.button("🚀 Processar Documentos", disabled=not uploaded_files):
         process_documents(uploaded_files)
+
+    st.divider()
+    st.toggle(
+        "🛠️ Modo agente",
+        key="agent_mode",
+        help=(
+            "O agente LangChain decide quais ferramentas usar: busca nos documentos, "
+            "consulta de pacotes no PyPI e verificação de vulnerabilidades no OSV.dev."
+        ),
+    )
 
 @check_performance
 def process_documents(uploaded_files):
@@ -123,7 +136,7 @@ def process_documents(uploaded_files):
         try:
             snapshots = _build_upload_snapshot(valid_files)
             
-            documents = SimpleDirectoryReader(temp_dir).load_data()
+            documents = load_documents(temp_dir)
             final_docs = []
             for doc in documents:
                 file_name = doc.metadata.get("file_name")
@@ -169,6 +182,13 @@ def handle_report_generation():
                 st.error(f"Falha ao gerar relatório: {e}")
                 st.session_state.logger.error(f"Failed to generate report: {e}", exc_info=True)
 
+def get_agent():
+    """Cria o agente sob demanda, reutilizando o LLM e o índice do motor RAG."""
+    if st.session_state.agent is None:
+        rag = st.session_state.rag_manager
+        st.session_state.agent = build_agent(rag.llm, rag)
+    return st.session_state.agent
+
 def display_chat_history():
     """Displays the chat history in the main area."""
     for message in st.session_state.chat_history:
@@ -192,7 +212,15 @@ def handle_chat_input():
                 
             with st.spinner("Analisando..."):
                 try:
-                    response = st.session_state.rag_manager.query(prompt, st.session_state.chat_history)
+                    if st.session_state.agent_mode:
+                        response = run_agent(
+                            get_agent(),
+                            prompt,
+                            st.session_state.chat_history,
+                            history_turns=ConfigSettings.history_turns,
+                        )
+                    else:
+                        response = st.session_state.rag_manager.query(prompt, st.session_state.chat_history)
                     st.markdown(response)
                     st.session_state.chat_history.append({"role": "assistant", "content": response})
                     st.session_state.logger.info("Assistant response successfully generated.")

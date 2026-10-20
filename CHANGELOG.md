@@ -7,15 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-This release improves container readiness for AWS deployments and ECR publishing.
+This release migrates the RAG engine from LlamaIndex to LangChain, adds an engineering agent with REST API tools, and introduces CI. It also improves container readiness for AWS deployments and ECR publishing.
 
 ### Added
 
+-   **LangChain Agent Mode**: New agent built with `langchain.agents.create_agent` that chooses between document search tools and REST APIs of technical libraries (PyPI package metadata and OSV.dev vulnerability lookups). Toggle it in the sidebar.
+-   **Automated Tests**: Unit tests with fake LLMs/embeddings for the conversational chain, report synthesis, embeddings fallback, loaders, and agent tool-calling, plus integration tests against a real PostgreSQL + pgvector.
+-   **CI Pipeline**: GitHub Actions workflow running ruff, pytest (Python 3.11 and 3.12), pgvector integration tests, and the Docker image build.
 -   **Container Port Exposure**: Exposed Streamlit port 8501 in the Docker image to simplify ECS/ECR deployments.
 
 ### Changed
 
+-   **LlamaIndex → LangChain**: The RAG engine now uses LangChain LCEL chains, `langchain-postgres` (`PGVector`), `RecursiveCharacterTextSplitter`, and LangChain provider integrations for Gemini and Bedrock (Converse API). The public `RAG` interface used by the UI is unchanged.
+-   **Report Synthesis**: LlamaIndex `tree_summarize` replaced by an explicit map-reduce tree summarization that respects the model context window.
+-   **Database Driver**: `psycopg2` replaced by `psycopg` 3; hash lookups now use parameterized SQL.
+-   **Docker Image**: Removed the NLTK download that was only needed by LlamaIndex.
 -   **Env Defaults for Container Runtime**: Added safe defaults and quote normalization for environment variables so the app can boot when `.env` is not bundled into the image (useful for AWS task-level env/secret injection).
+
+### Migration notes
+
+-   Vectors indexed by LlamaIndex are stored in a different table layout. After deploying, documents are re-indexed into the `langchain-postgres` collection named by `VECTOR_STORE_TABLE` on their next upload.
 
 ## [1.1.0] - 2026-03-31
 

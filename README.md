@@ -21,12 +21,28 @@ A infraestrutura é provisionada inteiramente via **AWS CDK** (presente no diret
 
 ## 🧠 Implementação do RAG
 
-O sistema RAG é orquestrado pela biblioteca **LlamaIndex** e adota boas práticas de engenharia de software aplicadas à IA:
+O sistema RAG é orquestrado com **LangChain** (cadeias LCEL) e adota boas práticas de engenharia de software aplicadas à IA:
 
-- **Ingestão Inteligente (Deduplicação):** Ao fazer o upload de documentos, o sistema gera um hash criptográfico (SHA-256). Antes de realizar as chamadas custosas para as APIs de Embedding (Bedrock ou Gemini), o banco vetorial verifica se o hash já foi indexado. Isso evita custos de token duplicados e "poluição" na base de conhecimento.
-- **Chunking e Resiliência de Vetorização:** Textos longos são quebrados em fragmentos (chunks) usando o `SentenceSplitter` preservando sobreposição semântica. A rotina implementa mecânicas de *delay* e *fallback* para tratar proativamente erros de "Rate Limit" e rejeição de lotes ao consumir embeddings externos.
-- **Contexto Isolado via Metadados:** Para evitar "vazamento de contexto" (alucinar respondendo com base em um relatório obsoleto em vez do documento em tela), o sistema injeta o hash do arquivo nos metadados do `pgvector`. Durante o chat, um Filtro de Metadados (`MetadataFilter`) restringe o sistema de forma rigorosa apenas aos arquivos da sessão atual.
-- **Síntese Estruturada (`Tree-Summarize`):** Ao gerar o relatório técnico, o sistema não faz apenas um resumo simples. O Clarus sintetiza o histórico da conversa no chat, cria sub-queries dinâmicas focadas nas necessidades demonstradas, e usa um algoritmo de sumarização em árvore (`Tree-Summarize`) para extrair os *insights* individualmente por documento de maneira controlada.
+- **Provedores intercambiáveis:** `ChatGoogleGenerativeAI`/`GoogleGenerativeAIEmbeddings` (Gemini) ou `ChatBedrockConverse`/`BedrockEmbeddings` (AWS Bedrock), escolhidos por `LLM_PROVIDER` em `src/providers.py`. O resto do código depende apenas das interfaces do LangChain.
+- **Ingestão Inteligente (Deduplicação):** Cada upload recebe um hash SHA-256. Antes de chamar a API de embeddings, o sistema consulta no `pgvector` quais hashes já foram indexados, evitando custo de tokens duplicado e "poluição" na base.
+- **Chunking e Resiliência de Vetorização:** `RecursiveCharacterTextSplitter` com sobreposição; o wrapper `ResilientEmbeddings` aplica *delay* (Bedrock) e *fallback* 1-a-1 quando um lote é rejeitado por rate limit.
+- **Contexto Isolado via Metadados:** O hash do arquivo vai para os metadados do `PGVector` (`langchain-postgres`). No chat, o retriever usa o filtro `{"file_hash": {"$in": [...]}}` para responder apenas com os arquivos da sessão atual.
+- **Busca Histórica Inteligente:** Uma classificação da pergunta decide se o filtro é removido para consultar documentos antigos.
+- **Conversa com memória (condense + context):** A pergunta é reescrita como pergunta independente a partir do histórico, os chunks são recuperados e o LLM responde citando o arquivo de origem.
+- **Síntese Estruturada (map-reduce em árvore):** No relatório, o Clarus resume a conversa, gera sub-queries, recupera trechos por documento e os sintetiza em níveis, respeitando a janela de contexto do modelo.
+
+## 🛠️ Modo Agente (LangChain `create_agent`)
+
+Ative **Modo agente** na barra lateral para que um agente LangChain decida quais ferramentas usar:
+
+| Ferramenta | O que faz | Fonte |
+| --- | --- | --- |
+| `search_documents` | Busca semântica nos documentos da sessão | pgvector |
+| `search_document_history` | Busca em todos os documentos já indexados | pgvector |
+| `get_python_package_info` | Versão mais recente, licença e Python exigido de um pacote | API REST do PyPI |
+| `check_package_vulnerabilities` | Vulnerabilidades conhecidas (CVEs) de uma versão e versões corrigidas | API REST do OSV.dev |
+
+Exemplo: *"Quais dependências esta especificação usa e alguma tem vulnerabilidade conhecida?"* → o agente busca as dependências no documento e consulta o OSV.dev para cada uma.
 
 ## 🚀 Como Executar Localmente
 
@@ -59,11 +75,21 @@ cp .env_example .env
 | `DB_HOST` | Host do banco RDS PostgreSQL. | `localhost` |
 | `DB_USER` | Usuário do banco de dados. | `clarus_admin` |
 | `DB_PASSWORD` | Senha de acesso do usuário de DB. | `***` |
-| `VECTOR_STORE_TABLE` | Nome da tabela interna de indexação vetorial. | `clarus_vectors` |
+| `VECTOR_STORE_TABLE` | Nome da coleção vetorial no `langchain-postgres`. | `clarus_vectors` |
 
 *(Consulte `config/settings.py` para ver todos os parâmetros suportados)*.
 
-### 4. Rodando o App
+### 4. Testes
+
+```bash
+pip install -r requirements-dev.txt
+ruff check src tests
+pytest
+```
+
+Os testes de integração com PostgreSQL + pgvector rodam quando `CLARUS_TEST_DB_HOST` está definido (no CI, um container `pgvector/pgvector:pg16` é usado). O pipeline do GitHub Actions (`.github/workflows/ci.yml`) roda lint, testes unitários, testes de integração e o build da imagem Docker.
+
+### 5. Rodando o App
 ```bash
 streamlit run ui/app.py
 ```
